@@ -1,0 +1,154 @@
+---
+title: "SEALS Model: Run Analysis & Code Logic"
+author: "Chiara"
+date: today
+format: 
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+---
+
+Inputs: Base Map (ESA) + Climate Data (LUH2).
+
+Split: Divide Country into 1-degree squares.
+
+Process:
+
+Worker 1: Downscales the North-West square.
+
+Worker 2: Downscales the North-East square.
+
+(...etc)
+
+Stitch: Glue squares back together.
+
+Output: Final Map.
+
+## 1. Introduction
+This document analyzes the successful execution of the **Spatial Economic Allocation of Landscape Systems (SEALS)** model. It connects the high-level configuration (`run_seals_standard.py`) with the underlying calculation engine (`seals_main.py`).
+
+**Goal:** Downscale coarse Global Climate Model (GCM) land-use data (LUH2) into high-resolution (300m) maps for Rwanda.
+
+## 2. The Configuration (`run_seals_standard.py`)
+This script is the "Driver." It sets up the environment and tells the model *what* to do.
+
+### Key Settings Used:
+* **Project Directory:** `~/Files/seals/projects/standard_[TIMESTAMP]`
+    * *Code:* `p.project_name = 'standard' ... + hb.pretty_time()`
+* **Base Data:** `~/Files/base_data` (Where the heavy TIFs are stored).
+* **Scenario Definition:** The model looked for `standard_scenarios.csv`.
+    * *Role:* This CSV defines the "Future" (e.g., SSP2-RCP4.5) that we simulated.
+* **Processing Resolution:** `1.0` Degree.
+    * *Code:* `p.processing_resolution = 1.0`
+    * *Meaning:* The model sliced Rwanda into $1^\circ \times 1^\circ$ chunks (zones) to process them in parallel.
+
+The model behavior is controlled by the `standard_scenarios.csv` file. By inspecting the file used in this run, we identified the specific settings:
+
+* **Area of Interest (AOI):** `RWA`
+    * This corresponds to **Rwanda**.
+    * *Implication:* The model downloaded data and allocated land use specifically for this country.
+* **Scenario:** `ssp2` / `rcp45`
+    * **SSP2 (Middle of the Road):** Assumes historical trends in economic growth continue.
+    * **RCP 4.5 (Moderate Climate Action):** Assumes emissions peak around 2040, then decline.
+* **Time Horizon:** `2030` and `2050`
+    * The model produced two maps: one for the near future (2030) and one for mid-century (2050).
+
+## 3. The Execution Logic (`seals_main.py`)
+The `seals_main.py` file contains the logic for the "Task Tree." Here is what happened during the run, mapped to the specific functions in the code.
+
+### Phase A: Pre-Processing (`fine_processed_inputs`)
+The model prepared the "Physical Reality" of the base year (2017).
+* **Logic:** It loaded the ESA Land Cover map.
+* **Convolution:** The code calculated "Neighborhood Effects."
+    * *Function:* `seals_utils.fft_gaussian` (Fast Fourier Transform).
+    * *Why?* It creates a "blur" around cities and farms. If a pixel is near an existing city, it has a higher probability of becoming urban in 2030.
+
+### Phase B: The Coarse Change (`coarse_change`)
+The model calculated the "Budget" of land required.
+* **Source:** LUH2 (Land Use Harmonization) data from the SSP2-RCP4.5 scenario.
+* **Calculation:** The model determined that for the specific grid cells covering Rwanda, we need $X$ new hectares of cropland and $Y$ new hectares of urban land by 2030.
+
+### Phase C: Allocation (`allocation_zones`)
+
+
+This is the core intelligence, found in the `allocation` function in `seals_main.py`.
+
+1.  **Parallelization:**
+    * The log showed `Iterators 0 through 5`.
+    * The model split Rwanda into 6 chunks based on the `1.0` degree setting.
+    * It ran a separate worker for each chunk (Parallel Processing).
+
+2.  **Suitability Calculation:**
+    * The model loaded **Coefficients** (regressors) from `default_global_coefficients.csv`.
+    * It calculated a score for every pixel:
+        $$Score = \beta_1(Slope) + \beta_2(DistanceToRoad) + \beta_3(SoilCarbon) + ...$$
+    * *Note:* In this run, we used *pre-trained* global coefficients. We did not run the `calibration_zones` function (which trains new AI coefficients) because it takes days to run.
+
+3.  **Expansion/Contraction:**
+    * The model selected the highest-scoring pixels and converted them until the "Budget" from Phase B was met.
+
+### Phase D: Stitching (`stitched_lulc_simplified_scenarios`)
+Once the 6 parallel workers finished, the `stitched_lulc...` function combined them.
+* **Mechanism:** It used `gdal.vrt` (Virtual Raster) to glue the 1-degree chunks back into a single seamless TIF file.
+* **Result:** `lulc_esa_seals7_ssp2_rcp45_..._2030.tif`
+
+## 4. Interpreting the Outputs
+
+You can find the results in your `projects` folder.
+
+| Output Folder | File Name | Meaning |
+| :--- | :--- | :--- |
+| `intermediate/stitched...` | `*.tif` | **The Map.** Open in QGIS. Values 1-7 represent land classes (Forest, Urban, etc). |
+| `intermediate/visualization` | `*.png` | **The Image.** A side-by-side comparison of 2017 vs 2030. |
+| `intermediate/coarse_change` | `*.csv/tif` | **The Math.** Shows exactly how many hectares of forest were lost in the scenario. |
+
+## 5. How to customize for the Thesis
+To run your own scenarios, we will modify `standard_scenarios.csv` (referenced in line 42 of the run script).
+
+* **To change the country:** We will change the "AOI" (Area of Interest) filter.
+* **To change the policy:** We will select a different "RCP" (Representative Concentration Pathway) or "SSP" (Shared Socioeconomic Pathway) in the CSV.
+
+
+
+
+#############################
+# Customize
+#######################
+
+
+### 2\. How to Customize the CSV 
+
+To run the model for your own study, you need to edit `standard_scenarios.csv` in VS Code.
+
+#### Task A: Change the Country
+
+1.  **Find your code:** Look up the "ISO Alpha-3 code" for your country (e.g., Vietnam = `VNM`, Italy = `ITA`, United States = `USA`).
+2.  **Edit the CSV:** Replace `RWA` with your code in **all three rows**.
+
+#### Task B: Change the Scenario (Advanced)
+
+If you want to simulate a "High Emissions" or "Sustainability" world, you need to change three things in the CSV:
+
+1.  **Labels:** Change `ssp2` $\rightarrow$ `ssp5` (for high emissions) or `ssp1` (for sustainability). Change `rcp45` $\rightarrow$ `rcp85` or `rcp26`.
+2.  **The Data Path (CRITICAL):**
+      * Look at the long column `coarse_projections_input_path`.
+      * Right now it points to: `.../rcp45_ssp2/...ssp245...nc`.
+      * You cannot just change the label; you must point this to the correct data file for the new scenario.
+      * *Tip:* If you stick to the standard scenarios provided in the author's other examples, this path might update automatically, or you might need to browse the Google Cloud bucket to find the correct filename for SSP1 or SSP5.
+
+### Summary Checklist for your next run:
+
+1.  Open `standard_scenarios.csv` in VS Code.
+2.  Change `RWA` to your thesis country code (e.g., `ITA`).
+3.  Save the file.
+4.  Run `python run_seals_standard.py`.
+
+**Do you know which country and which scenario (SSP/RCP) you plan to use for your thesis?** I can help you find the correct file paths if you do.
+
+
+
+scenario_label,scenario_type,aoi,exogenous_label,climate_label,model_label,counterfactual_label,years,baseline_reference_label,base_years,key_base_year,comparison_counterfactual_labels,time_dim_adjustment,coarse_projections_input_path,lulc_src_label,lulc_simplification_label,lulc_correspondence_path,coarse_src_label,coarse_simplification_label,coarse_correspondence_path,lc_class_varname,dimensions,calibration_parameters_source,base_year_lulc_path,regional_projections_input_path,regions_vector_path,regions_column_label
+baseline_luh2-message,baseline,RWA,baseline,,luh2-message,,2017,,2017,2017,,add2015,luh2/raw_data/rcp45_ssp2/multiple-states_input4MIPs_landState_ScenarioMIP_UofMD-MESSAGE-ssp245-2-1-f_gn_2015-2100.nc,esa,seals7,seals/default_inputs/esa_seals7_correspondence.csv,luh2-14,seals7,seals/default_inputs/luh2-14_seals7_correspondence.csv,all_variables,time,seals/default_inputs/default_global_coefficients.csv,lulc\esa\lulc_esa_2017.tif,,cartographic/ee/ee_r264_correspondence.gpkg,ee_r264_label
+ssp2_rcp45_luh2-message_bau,bau,RWA,ssp2,rcp45,luh2-message,bau,2030 2050,baseline_luh2-message,2017,2017,,add2015,luh2/raw_data/rcp45_ssp2/multiple-states_input4MIPs_landState_ScenarioMIP_UofMD-MESSAGE-ssp245-2-1-f_gn_2015-2100.nc,esa,seals7,seals/default_inputs/esa_seals7_correspondence.csv,luh2-14,seals7,seals/default_inputs/luh2-14_seals7_correspondence.csv,all_variables,time,seals/default_inputs/default_global_coefficients.csv,lulc\esa\lulc_esa_2017.tif,,cartographic/ee/ee_r264_correspondence.gpkg,ee_r264_label
+ssp2_rcp45_luh2-message_bau_shift,policy,RWA,ssp2,rcp45,luh2-message,bau_shift,2030 2050,baseline_luh2-message,2017,2017,ssp2_rcp45_luh2-message_bau,add2015,luh2/raw_data/rcp45_ssp2/multiple-states_input4MIPs_landState_ScenarioMIP_UofMD-MESSAGE-ssp245-2-1-f_gn_2015-2100.nc,esa,seals7,seals/default_inputs/esa_seals7_correspondence.csv,luh2-14,seals7,seals/default_inputs/luh2-14_seals7_correspondence.csv,all_variables,time,seals/default_inputs/default_global_coefficients.csv,lulc\esa\lulc_esa_2017.tif,seals/default_inputs/rwa_bdi_regional_changes.csv,cartographic/ee/ee_r264_correspondence.gpkg,ee_r264_label
