@@ -187,7 +187,7 @@ This sets up the parallel processing grid.
 
 It runs inside a single tile.
 
-1.  **`spatial_layers_3d` (Line \~1288)**:
+1.  **`spatial_layers_3d`**:
       * It creates a 3D Numpy array.
       * Dimension 0: The Layer ID (Slope, Soil, Convolution).
       * Dimensions 1 & 2: The X/Y rows and columns of the map.
@@ -195,7 +195,7 @@ It runs inside a single tile.
 2.  **`coarse_change_matrix_4d`**:
       * It loads the `coarse_change` demand 
 3.  It reads `default_global_coefficients.csv` (the $\beta$ weights).
-4.  **`calibrate(...)` (Line \~2253)**:
+4.  **`calibrate(...)`**:
       * It calls the Cython function, which wraps the C++ `seals_allocation_gridded_input` (imported as `from seals.seals_cython_functions import calibrate`). 
       * It passes the 3D map stack (`spatial_layers_3d`) and the coefficients (`generation_best_parameters`) into the compiled C++ code. *Inside C++:* It ranks pixels by score $S$. It converts the top-ranked pixels until the Budget is met.
       * **Return:** `lulc_projected_array` (The finished map for this tile).
@@ -273,7 +273,7 @@ current_to_rank_arrays[from_class] += (
 ### **The Greedy Allocation**
 
 1.  **`current_raveled...argsort`**: It sorts all pixels in the coarse cell from Highest Score to Lowest.
-2.  **`while` loop (Line \~545)**:
+2.  **`while` loop**:
       * It loops through the sorted pixels.
       * **`if current_goal_left > 0`**: If we still need to find land for the budget...
       * **`projected_lulc[...] = changing_class_indices[...]`**: Convert the pixel\!
