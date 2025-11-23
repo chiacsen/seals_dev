@@ -1,0 +1,363 @@
+
+## Phase A: Fine-Scale Pre-Processing
+
+**Directory:** `intermediate/fine_processed_inputs/`
+
+This phase transforms the raw global satellite data into inputs required for the allocation algorithm. It executes four specific sub-tasks defined in `seals_generate_base_data.py`:
+
+1.  **`lulc_clip`:** The model reads the global ESA Climate Change Initiative (CCI) Land Cover map (\~50GB) and clips it to the vector bounding box of the AOI.
+2.  **`lulc_simplifications`:** It reclassifies the complex ESA legend (22 classes) into the standard **SEALS7** scheme (1=Urban, 2=Crop, 3=Grass, 4=Forest, etc.).
+3.  **`lulc_binaries`:** It decomposes the single categorical map into **7 separate binary maps** (one for each class, where 1=Present, 0=Absent).
+4.  **`lulc_convolutions` (The "Neighborhood" Effect):**
+      * **Logic:** To simulate agglomeration (e.g., cities growing near cities), the model applies a **Gaussian Blur** to the binary maps.
+      * **Implementation:** It uses `seals_utils.fft_gaussian()`, which performs a Fast Fourier Transform convolution for computational efficiency.
+      * **Output:** A continuous "Proximity Surface" ($X_{conv}$) where pixels in the center of a cluster have values near 1.0, and isolated pixels have values near 0.0.
+
+-----
+
+## Phase B: Coarse Change Pipeline
+
+**Directory:** `intermediate/coarse_change/`
+
+This phase calculates the **Exogenous Demand** (The Budget). It processes the Global Model (LUH2) data through a pipeline of four transformations in `seals_process_coarse_timeseries.py`:
+
+1.  **`coarse_extraction`:**
+      * Reads the multi-dimensional NetCDF (`.nc`) file.
+      * Slices the spatial dimension to the AOI.
+      * **Interpolation:** If the simulation year (e.g., 2045) does not exist in the source data, it performs linear interpolation between the nearest available time steps (e.g., 2040 and 2050).
+2.  **`coarse_simplified_proportion`:** Aggregates complex LUH2 variable types (e.g., "C3 Annual Crop" + "C4 Perennial Crop") into the SEALS7 classes (e.g., "Cropland").
+3.  **`coarse_simplified_ha`:** Converts "Grid Cell Proportion" (0.0 to 1.0) into "Physical Area" (Hectares). This accounts for the changing size of grid cells at different latitudes.
+4.  **`coarse_simplified_ha_difference...`:** Calculates the **Net Change Vector**:
+    $$\text{Demand}_{t+1} = \text{Area}_{t+1} - \text{Area}_{t}$$
+      * *Result:* A map where each 50km cell contains the exact number of hectares to expand or contract.
+
+-----
+
+## Phase C: Regional Refinement & Allocation
+
+**Directory:** `intermediate/allocation_zones/`
+
+### C.1 Regional Change (`regional_change`)
+
+  * **Standard Run:** If no regional policy file is provided in the CSV, this task acts as a **Pass-Through**. It simply copies the Coarse Change data into the `regional_change` folder to standardize the input structure.
+  * **Policy Run:** If a regional vector file is provided, it calculates specific sub-national demands (e.g., "Lombardy Region Forest Policy") and overrides the global signal.
+
+### C.2 Spatial Allocation (`allocation_zones`)
+
+This is the core engine. The model uses `multiprocessing` to split the country into independent $1^\circ \times 1^\circ$ tiles. Inside each tile, the `seals_cython_functions.pyx` module executes a **Constrained Spatial Utility Maximization**:
+
+1.  **Suitability Scoring:** Every 300m pixel $i$ is assigned a score ($S$) for every changing land class $c$:
+    $$S_{i,c} = \alpha + \beta_{phys} X_{slope, soil} + \beta_{econ} X_{distance} + \beta_{agg} X_{convolution} + \epsilon$$
+
+      * *Note:* The $\beta$ coefficients are loaded from `default_global_coefficients.csv`.
+
+2.  **Greedy Allocation Algorithm:**
+
+      * The model sorts all eligible pixels by Score ($S$) from high to low.
+      * It iteratively converts pixels to the target class.
+      * **Stop Condition:** The loop terminates exactly when the sum of converted pixels equals the **Net Change Demand** calculated in Phase B.
+
+-----
+
+## Phase D: Stitching and Stamping
+
+**Directory:** `intermediate/stitched_lulc_simplified_scenarios/`
+
+Because the allocation was performed on isolated tiles, the final map must be reassembled. The `stitched_lulc...` function performs a **Mosaic Stamping** operation:
+
+1.  **Virtual Mosaic:** It creates a GDAL Virtual Raster (VRT) pointing to all the processed `zone_X_Y.tif` tiles.
+2.  **Superposition (Stamping):**
+      * **Layer 0 (Bottom):** It lays down the **Base Year Map** (ESA 2017).
+      * **Layer 1 (Top):** It stamps the **New Allocation Tiles** on top.
+      * *Why?* This ensures that any pixel that did not change (or was located in a tile with zero demand) retains its original historical value.
+3.  **Clipping:** The resulting map is clipped to the exact vector boundary of the AOI to remove the jagged edges of the processing tiles.
+
+
+
+## Phase E: Visualization 
+
+**Directory:** `Directory: intermediate/visualization/lulc_pngs/`
+
+1. Visualization (Parent): Establishes the output directory structure.
+
+2. lulc_pngs: Reads the final stitched GeoTIFFs.
+
+3. Applies the standard SEALS7 color palette (e.g., Urban=Red, Forest=Green).
+
+4. Exports .png images for immediate inspection without requiring GIS software.
+
+
+
+------------------
+
+# 1\. `seals_initialize_project.py` 
+
+It builds the **Task Tree** and registers functions into the `hazelbean.ProjectFlow` object (`p`).
+
+### **Key Function: `build_standard_task_tree(p)`**
+
+This is the function called in the run script (`run_seals_standard.py`). It defines the dependency graph.
+
+1.  **`p.add_task(seals_tasks.project_aoi)`** (from `seals_tasks`):
+
+      * Registers the task to download the country boundary.
+
+2.  **`p.fine_processed_inputs_task`** (from `seals_generate_base_data`):
+
+      * This is a "Parent Task." It groups several sub-tasks together.
+      * **`p.generated_kernels_task`**: Registers `seals_generate_base_data.generated_kernels`. Creates several tiny geotiffs of gaussian-like kernels for later use in ffn_convolve 
+      * **`lulc_clip_task`**: Registers `seals_generate_base_data.lulc_clip`. Clip the fine LULC to the project AOI
+      * **`lulc_simplifications_task`**: Registers `seals_generate_base_data.lulc_simplifications`. Simplify the LULC to the 7 SEALS classes (from 22?)
+      * **`lulc_binaries_task`**: Registers `seals_generate_base_data.lulc_binaries`. Convert the simplified LULC into 1 binary presence map for each simplified LUC. Splits the map into 7 separate 0/1 files: one for Urban, one for Forest, etc.
+      * **`lulc_convolutions_task`**: Registers `seals_generate_base_data.lulc_convolutions`. This is where `fft_gaussian` is triggered. After creating binaries, run the Gaussian blur on them. Convolve the lulc_binaries
+
+3.  **`p.coarse_change_task`** (from `seals_process_coarse_timeseries`):
+
+      * **`coarse_change_task`**: Folder with all coarse data
+      * **`extraction_task`**: Extract coarse change from source for the aoi
+      * **`coarse_simplified_proportion_task`**: Registers `seals_process_coarse_timeseries.coarse_simplified_proportion`. Reclassify coarse source to simplified scheme. LUH distinguishes between "C3 Annual Crops", "C4 Perennial Crops", "Nitrogen Fixing Crops", etc. SEALS only uses "Cropland." This task sums them up using `coarse_correspondence.csv`.
+      * **`coarse_simplified_ha_task`**: Registers `seals_process_coarse_timeseries.coarse_extraction`. Converts proportion to ha for each input to avoid issues with different grid sizes at different latitudes
+      * **`coarse_simplified_ha_difference_from_base_year`**: Subtracts the Base Year hectares from the Future Year hectares to derive the Net Change Demand.
+
+4.  **`p.regional_change_task`** (from `seals_process_coarse_timeseries`):
+      * **`regional_change_task`**: Allows the injection of sub-national constraints
+
+5.  **`p.allocation_zones_task`** (from `seals_main`):
+
+      * **`p.allocations`**: From `seals_main.allocations`. Iterates through every scenario. For each combination, it sets the global project state (e.g., p.current_year = 2030) and triggers the next task level.
+      * **`p.allocation_zones_task `**: Define the zones overwhich parallel allocation should be run. It assigns each child task to a separate CPU core to run simultaneously.
+      * **`p.allocation_task `**: Actually do the allocation. Loads the local slice of the Suitability Regressors (Slope, Soil, Convolution) and the Demand. Calculate the score. Runs the compiled Cython loop to convert pixels until the local budget is met. Writes the specific file `zone_208_91_lulc.tif`
+
+6.  **`p.stitched_lulc_simplified_scenarios_task`** (from `seals_main`):
+
+      * `allocation_zones` chopped the aoi and sent them to different CPUs. Stitch the simplified LULC tiles back together. Takes the Original Base Year Map (ESA 2017) and lays it down as the bottom layer. It "stamps" the New Predicted Tiles on top of it (only pixels that changed are overwritten). produce `lulc_esa_seals7_ssp2_rcp45_luh2-message_bau_2040.tif`.
+
+7.  **`p.visualization_task`** (from `seals_visualization_tasks`)
+
+      * `p.visualization_task`: create folder
+      * `p.lulc_pngs_task`: plot stiched maps
+
+-----
+
+# 2\. `seals_main.py` (The Execution Logic)
+
+This file contains the actual Python code that runs when the Task Tree triggers a step.
+
+### **Function: `coarse_extraction(p)`** (Line \~1088 in your paste)
+
+This function handles the LUH2 Data.
+
+1.  **`for index, row in list(p.scenarios_df.iterrows()):`**
+      * It loops through every row in your CSV.
+2.  **`src_nc_path = ...`**:
+      * It constructs the path to the NetCDF file in `base_data`.
+3.  **`dst_dir = ...`**:
+      * It creates the folder `intermediate/coarse_change/...`.
+4.  **`extract_global_netcdf(...)`**:
+      * This calls a hazelbean helper. It opens the NetCDF, reads the `lat/lon` arrays, finds the indices that overlap with your AOI (Italy), and saves *only* that slice to a GeoTIFF.
+      * **Why?** GeoTIFFs are faster to read for the allocation step than NetCDF files.
+
+### **Function: `coarse_simplified_ha_difference_from_previous_year(p)`** (Line \~1255)
+
+This calculates the **Demand**.
+
+1.  **`for year_c, year in enumerate(p.years):`**:
+      * It loops through 2040, 2060.
+2.  **`current_array = (input_array - base_year_array) * ha_per_cell_array`**:
+      * **`input_array`**: The projected fraction (e.g., 0.35 Urban) from the future year.
+      * **`base_year_array`**: The fraction from the previous step.
+      * **`ha_per_cell_array`**: The physical area of the cell (which changes based on latitude).
+      * **Result:** A map where pixel values represent **Hectares of Change Required**.
+
+### **Function: `allocation_zones(p)`** (Line \~973)
+
+This sets up the parallel processing grid.
+
+1.  **`hb.get_global_block_list_from_resolution(...)`**:
+      * It mathematically divides the world into tiles based on `p.processing_resolution` (1.0 degree).
+2.  **`processing_blocks_list`**:
+      * It creates a list of tile IDs (e.g., `208_91`, `208_92`).
+3.  **`p.iterator_replacements`**:
+      * This is the "Magic" of the parallelization. It injects the specific Tile ID into the `p` object for each worker, so Worker \#1 knows "I am responsible for Tile 208\_91."
+
+### **Function: `allocation(p)`** (Line \~1136)
+
+**This is the most important function.** It runs inside a single tile.
+
+1.  **`spatial_layers_3d` (Line \~1288)**:
+      * It creates a 3D Numpy array.
+      * Dimension 0: The Layer ID (Slope, Soil, Convolution).
+      * Dimensions 1 & 2: The X/Y rows and columns of the map.
+      * *Code:* `spatial_layers_3d[c] = hb.load_geotiff_chunk_by_cr_size(...)`. It loads the convolution maps created earlier.
+2.  **`coarse_change_matrix_4d`**:
+      * It loads the "Budget" we calculated in Phase B.
+3.  **`calibrate(...)` (Line \~1425)**:
+      * It calls the Cython function (imported as `from seals.seals_cython_functions import calibrate`).
+      * It passes the 3D map stack (`spatial_layers_3d`) and the coefficients (`generation_best_parameters`) into the compiled C++ code.
+      * **Return:** `lulc_projected_array` (The finished map for this tile).
+4.  **`hb.save_array_as_geotiff(...)`**:
+      * Saves the result as `zone_X_Y.tif`.
+
+
+You are absolutely right. My previous explanation of `seals_main.py` skipped the **Outer Iterator** (`allocations`), which makes the logic incomplete. The hierarchy is **Allocations (Time/Scenario) $\to$ Zones (Space) $\to$ Allocation (Math).**
+
+Here is the corrected, comprehensive breakdown of `seals_main.py` that perfectly matches the code structure and the Task Tree logic.
+
+***
+
+# 2. `seals_main.py` (The Execution Logic)
+
+This file contains the actual Python code that runs when the Task Tree triggers a step. It is organized into **Phases**, with the Allocation phase being a nested hierarchy.
+
+## Phase B Functions: The Demand
+
+### **Function: `coarse_extraction(p)`**
+* **Location:** Line ~1088
+* **Role:** The Data Miner.
+* **Logic:**
+    1.  **Iterate:** Loops through the `scenarios_df` (from your CSV).
+    2.  **Locate:** Finds the massive NetCDF file defined in `coarse_projections_input_path`.
+    3.  **Extract:** Calls `extract_global_netcdf`. This function:
+        * Slices the global data to the `aoi` bounding box (Italy).
+        * **Interpolates:** If you requested 2040 but data exists for 2030/2050, it calculates the weighted average.
+    4.  **Output:** Saves raw GeoTIFFs of the climate variables (e.g., `c3ann.tif`) to `intermediate/coarse_change`.
+
+### **Function: `coarse_simplified_ha_difference_from_previous_year(p)`**
+* **Location:** Line ~1255
+* **Role:** The Accountant.
+* **Logic:**
+    1.  **Load:** Reads the Future Map (2040) and the Previous Map (2017).
+    2.  **Calculate Delta:**
+        `Demand = (Future_Fraction - Past_Fraction) * Cell_Area_Hectares`
+    3.  **Output:** A map where pixel values represent the **Physical Land Budget** (e.g., +500ha) needed in that specific 50km grid cell.
+
+---
+
+## Phase C Functions: The Allocation Hierarchy
+
+This is the most complex part of the script. It uses a **Nested Iterator** structure to handle Time (Scenarios) and Space (Tiles).
+
+### **Level 1: `allocations(p)` (The Scheduler)**
+* **Location:** Line ~844
+* **Role:** The Outer Loop (Time & Scenario).
+* **Logic:**
+    1.  **Iterate:** It loops through every year in your CSV (e.g., 2030, 2040, 2050).
+    2.  **Setup Context:** It defines the variables for the current run (e.g., `p.current_year = 2030`, `p.previous_year = 2017`).
+    3.  **Define Output Path:** It sets the directory to `intermediate/allocations/ssp2/.../2030/`.
+    4.  **Pass Down:** It passes these settings to the next task (`allocation_zones`).
+    * *Note: It does not do spatial math. It just sets the stage.*
+
+### **Level 2: `allocation_zones(p)` (The Foreman)**
+* **Location:** Line ~973
+* **Role:** The Middle Loop (Spatial Decomposition).
+* **Logic:**
+    1.  **Grid Calculation:** It calls `hb.get_global_block_list...` to divide the AOI (Italy) into $1^\circ \times 1^\circ$ tiles based on `p.processing_resolution`.
+    2.  **Filtering:** It checks which tiles actually contain land (skipping ocean-only tiles) to optimize speed.
+    3.  **Iterator Replacements:** It creates a list of specific Tile IDs (e.g., `208_91`, `208_92`).
+    4.  **Spawn Workers:** It registers the `allocation` task to run in **Parallel** (`run_in_parallel=1`). This assigns each tile to a different CPU core.
+
+### **Level 3: `allocation(p)` (The Worker)**
+* **Location:** Line ~1136
+* **Role:** The Inner Execution (The Engine).
+* **Logic:** This runs inside a single tile on a single CPU.
+    1.  **Load Regressors:** It builds `spatial_layers_3d` by loading the Slope, Soil, and **Convolution** maps (from Phase A) for this specific tile.
+    2.  **Load Budget:** It loads the `coarse_change` demand calculated in Phase B.
+    3.  **Load Coefficients:** It reads `default_global_coefficients.csv` (the $\beta$ weights).
+    4.  **Execute Algorithm:** It calls `calibrate()` (which wraps the C++ `seals_allocation_gridded_input`).
+        * *Inside C++:* It ranks pixels by score $S$. It converts the top-ranked pixels until the Budget is met.
+    5.  **Output:** It saves the local result as `zone_X_Y_lulc.tif`.
+
+---
+
+## Phase D Functions: Assembly
+
+### **Function: `stitched_lulc_simplified_scenarios(p)`**
+* **Location:** Line ~1400
+* **Role:** The Assembler.
+* **Logic:**
+    1.  **Gather:** It uses `hb.list_filtered_paths_recursively` to find all the `zone_*.tif` files created by the parallel workers.
+    2.  **Virtual Mosaic:** It creates a GDAL VRT (Virtual Raster) to treat the tiles as one map.
+    3.  **The "Stamp" (Superposition):**
+        * *Code:* `p.layers_to_stitch.insert(0, base_year_map)`
+        * It lays down the **Original 2017 Map** as the background layer.
+        * It "stamps" the new 2040 tiles on top.
+        * *Why?* This ensures that any pixel not touched by the workers (no change) retains its historical value, preventing data gaps.
+    4.  **Clip:** If `p.clip_to_aoi` is True, it crops the jagged square edges to the exact vector boundary of Italy.
+    5.  **Output:** The final `lulc_..._2040.tif`.
+-----
+
+# 3\. `seals_utils.py` 
+
+`seals_main.py` calls these functions to do specific math operations.
+
+### **Function: `fft_gaussian`** (Line \~114)
+
+This creates the "Neighborhood" variable used in allocation.
+
+1.  **Arguments:** `signal_path` (The binary map), `kernel_path` (The gaussian bell curve image).
+2.  **`convolve_2d(...)`**:
+      * This comes from `pygeoprocessing`.
+      * It performs: $Map \times Kernel$.
+      * Because the map is massive, doing this pixel-by-pixel is too slow.
+      * **FFT Logic:** It converts the image to frequency waves, multiplies them, and converts back. This is $O(N \log N)$ speed instead of $O(N^2)$.
+3.  **Output:** A raster where every pixel represents "Urban Density in the neighborhood."
+
+### **Function: `assign_df_row_to_object_attributes`** (Line \~642)
+
+This is a helper used constantly in `seals_main.py`.
+
+1.  **Input:** A row from your CSV (e.g., the Italy row).
+2.  **Logic:**
+      * It loops through every column (`aoi`, `years`, `model_label`).
+      * `setattr(input_object, attribute_name, attribute_value)`: It dynamically attaches these variables to the `p` object.
+      * *This is why `p.aoi` works in Python even though you only defined `aoi` in the CSV.*
+
+-----
+
+# 4\. `seals_cython_functions.pyx` (The Allocation Engine)
+
+You provided the code for `seals_allocation_gridded_input` (which is called by `calibrate`). This is where the "Auction" happens.
+
+### **The Loop (Line \~419)**
+
+```python
+for coarse_r in range(n_coarse_rows):
+    for coarse_c in range(n_coarse_cols):
+```
+
+  * It iterates through every 50km coarse cell inside the 1-degree tile.
+
+### **The Suitability Calculation (Line \~464)**
+
+```python
+current_to_rank_arrays[from_class] += (
+    spatial_layer_coefficients_2d[class_position, regressor_k] *
+    spatial_layers_3d[regressor_k, ...]
+)
+```
+
+  * **`spatial_layers_3d`**: This is the stack of maps (Slope, Soil, Convolution).
+  * **`spatial_layer_coefficients_2d`**: These are your Beta ($\beta$) weights.
+  * **Logic:** It multiplies Map $\times$ Beta and adds them up. This creates the **Suitability Score** for every pixel.
+
+### **The Greedy Allocation (Line \~523)**
+
+1.  **`current_raveled...argsort`**: It sorts all pixels in the coarse cell from Highest Score to Lowest.
+2.  **`while` loop (Line \~545)**:
+      * It loops through the sorted pixels.
+      * **`if current_goal_left > 0`**: If we still need to find land for the budget...
+      * **`projected_lulc[...] = changing_class_indices[...]`**: Convert the pixel\!
+      * **`current_goal_left -= hectares...`**: Deduct the pixel area from the budget.
+
+This loop continues until the budget reaches 0.
+
+-----
+
+### Summary of the Data Flow
+
+1.  **`seals_initialize`** tells the system: "We need to run `fine_processed_inputs`."
+2.  **`seals_main.fine_processed_inputs`** creates binary maps and calls `seals_utils.fft_gaussian`.
+3.  **`seals_utils.fft_gaussian`** creates the convolution (neighborhood) map.
+4.  **`seals_initialize`** tells the system: "Run `allocation`."
+5.  **`seals_main.allocation`** loads the convolution map and the coefficients. It passes them to `seals_cython`.
+6.  **`seals_cython`** calculates `Score = Beta * Convolution`. It ranks the pixels. It fills the budget. It returns the final map.

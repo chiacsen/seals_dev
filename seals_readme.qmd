@@ -9,7 +9,58 @@ format:
     theme: cosmo
 ---
 
-Inputs: Base Map (ESA) + Climate Data (LUH2).
+1.1 The Problem: The "Resolution Gap"
+Global Integrated Assessment Models (IAMs) like LUH2 (Land Use Harmonization) operate at a massive scale (typically ~50km pixels). They provide the "Big Picture" for climate change scenarios (e.g., "Italy needs 500 more hectares of cropland by 2040"), but they cannot tell you where that cropland should go. They lack local context.
+
+1.2 The Solution: SEALS
+SEALS is a Downscaling Engine. It acts as a translator between the coarse global models and the fine-grained physical reality of a specific country.
+
+The Input (The "Budget"): The Global Model says: "+500ha Cropland, -200ha Forest in grid cell X."
+
+The Process (The "Allocation"): SEALS looks at the local geography (Slope, Soil Quality, Distance to Roads, Proximity to existing farms) to find the best pixels to satisfy that budget.
+
+The Output (The "Map"): A 300m resolution map showing exactly which pixels changed.
+
+
+
+git pull upstream main to get new stuff from seals and hazebean
+
+2.1 Git Configuration (Triangular Workflow)
+To keep your thesis work private while staying updated with the author's code:
+
+Clone the author's repository.
+
+Rename the remote: git remote rename origin upstream.
+
+Create a private repo on GitHub.
+
+Add your remote: git remote add origin <your_private_repo_url>.
+
+2.2 The Environment (seals_env)
+You must create a Conda environment to handle the C++ dependencies.
+
+Bash
+
+# 1. Create the environment (Do this once)
+conda create -n seals_env python=3.11 gdal pandas geopandas
+
+# 2. Activate the environment (Do this EVERY time you work)
+conda activate seals_env
+
+
+
+**Spatial Economic Allocation of Landscape Systems**
+
+## 1\. Intuition: What is SEALS?
+
+SEALS is a "Downscaling" model. It takes coarse, low-resolution predictions about the future of the world and translates them into high-resolution, actionable maps for specific countries.
+
+  * **The Input (The "Budget"):** Global Integrated Assessment Models (IAMs) provide data like "Rwanda will need 500 new hectares of cropland by 2040." This data is coarse (50km pixels) and doesn't say *where* that cropland should go.
+  * **The Process (The "Allocation"):** SEALS looks at the physical reality of the country (Slope, Soil, Distance to Markets, Neighborhoods) to decide the most likely locations for that change.
+  * **The Output (The "Map"):** A 300m resolution map showing exactly which pixels turned into cropland, urban areas, or forest.
+
+-----
+
 
 Split: Divide Country into 1-degree squares.
 
@@ -24,6 +75,68 @@ Worker 2: Downscales the North-East square.
 Stitch: Glue squares back together.
 
 Output: Final Map.
+
+
+## 2\. System Requirements & Installation
+
+SEALS relies on `gdal`, a powerful C++ geospatial library. It must be installed in a specific way using Conda to avoid "DLL load failed" or "Image not found" errors.
+
+### 2.1 The Environment (`seals_env`)
+
+Always activate this environment before working.
+
+```bash
+# Create the environment (Do this once)
+conda create -n seals_env python=3.11 gdal pandas geopandas
+
+# Activate the environment (Do this every time)
+conda activate seals_env
+```
+
+### 2.2 Installation
+
+You must install the core engine (`hazelbean`) and the model (`seals`) in "Editable Mode".
+
+```bash
+# Navigate to the folders and install
+cd ~/Files/hazelbean/hazelbean_dev
+pip install -e .
+
+cd ~/Files/seals/seals_dev
+pip install -e .
+```
+
+-----
+
+## 3\. The "Golden" Folder Structure
+
+To avoid confusion and "Ghost Files," we separate **Code**, **Data**, and **Projects**.
+
+### The Root Directory: `~/Files/`
+
+The model expects this folder to exist in your User Home directory.
+
+```text
+/Users/your_name/Files/
+│
+├── base_data/                  <-- RAW INPUTS (Heavy)
+│   ├── lulc/                   (ESA satellite maps)
+│   ├── luh2/                   (Climate/Economic projections)
+│   └── seals/                  (Regressors like soil, slope)
+│
+└── seals/
+    ├── seals_dev/              <-- YOUR CODE REPOSITORY
+    │   ├── seals/              (Source code)
+    │   ├── scenarios/          <-- YOUR CSV CONFIGURATIONS (Edit these!)
+    │   └── run_thesis.py       <-- YOUR DRIVER SCRIPT
+    │
+    └── projects/               <-- MODEL OUTPUTS (Don't edit these)
+        ├── standard_rwanda/
+        └── italy_ssp2_run/     (Results appear here)
+```
+
+-----
+
 
 ## 1. Introduction
 This document analyzes the successful execution of the **Spatial Economic Allocation of Landscape Systems (SEALS)** model. It connects the high-level configuration (`run_seals_standard.py`) with the underlying calculation engine (`seals_main.py`).
@@ -56,6 +169,23 @@ The model behavior is controlled by the `standard_scenarios.csv` file. By inspec
 
 ## 3. The Execution Logic (`seals_main.py`)
 The `seals_main.py` file contains the logic for the "Task Tree." Here is what happened during the run, mapped to the specific functions in the code.
+    In SEALS, the Task Tree looks exactly like the folder structure in your intermediate folder:
+
+    ROOT (execute)
+
+    Branch 1: project_aoi (Get the country boundary)
+
+    Branch 2: fine_processed_inputs (Prepare the 300m maps)
+    Leaf: lulc_clip (Cut the map to Italy)
+    Leaf: generated_kernels (Calculate neighborhood effects)
+
+    Branch 3: coarse_change (Calculate the math/budget)
+    Leaf: coarse_extraction (Read the climate file)
+
+    Branch 4: allocations (The hard work)
+    Leaf: allocation_zones (Run parallel workers)
+
+    Branch 5: stitched_lulc (Glue it all back together)
 
 ### Phase A: Pre-Processing (`fine_processed_inputs`)
 The model prepared the "Physical Reality" of the base year (2017).
@@ -70,7 +200,6 @@ The model calculated the "Budget" of land required.
 * **Calculation:** The model determined that for the specific grid cells covering Rwanda, we need $X$ new hectares of cropland and $Y$ new hectares of urban land by 2030.
 
 ### Phase C: Allocation (`allocation_zones`)
-
 
 This is the core intelligence, found in the `allocation` function in `seals_main.py`.
 
@@ -148,7 +277,377 @@ If you want to simulate a "High Emissions" or "Sustainability" world, you need t
 
 
 
-scenario_label,scenario_type,aoi,exogenous_label,climate_label,model_label,counterfactual_label,years,baseline_reference_label,base_years,key_base_year,comparison_counterfactual_labels,time_dim_adjustment,coarse_projections_input_path,lulc_src_label,lulc_simplification_label,lulc_correspondence_path,coarse_src_label,coarse_simplification_label,coarse_correspondence_path,lc_class_varname,dimensions,calibration_parameters_source,base_year_lulc_path,regional_projections_input_path,regions_vector_path,regions_column_label
-baseline_luh2-message,baseline,RWA,baseline,,luh2-message,,2017,,2017,2017,,add2015,luh2/raw_data/rcp45_ssp2/multiple-states_input4MIPs_landState_ScenarioMIP_UofMD-MESSAGE-ssp245-2-1-f_gn_2015-2100.nc,esa,seals7,seals/default_inputs/esa_seals7_correspondence.csv,luh2-14,seals7,seals/default_inputs/luh2-14_seals7_correspondence.csv,all_variables,time,seals/default_inputs/default_global_coefficients.csv,lulc\esa\lulc_esa_2017.tif,,cartographic/ee/ee_r264_correspondence.gpkg,ee_r264_label
-ssp2_rcp45_luh2-message_bau,bau,RWA,ssp2,rcp45,luh2-message,bau,2030 2050,baseline_luh2-message,2017,2017,,add2015,luh2/raw_data/rcp45_ssp2/multiple-states_input4MIPs_landState_ScenarioMIP_UofMD-MESSAGE-ssp245-2-1-f_gn_2015-2100.nc,esa,seals7,seals/default_inputs/esa_seals7_correspondence.csv,luh2-14,seals7,seals/default_inputs/luh2-14_seals7_correspondence.csv,all_variables,time,seals/default_inputs/default_global_coefficients.csv,lulc\esa\lulc_esa_2017.tif,,cartographic/ee/ee_r264_correspondence.gpkg,ee_r264_label
-ssp2_rcp45_luh2-message_bau_shift,policy,RWA,ssp2,rcp45,luh2-message,bau_shift,2030 2050,baseline_luh2-message,2017,2017,ssp2_rcp45_luh2-message_bau,add2015,luh2/raw_data/rcp45_ssp2/multiple-states_input4MIPs_landState_ScenarioMIP_UofMD-MESSAGE-ssp245-2-1-f_gn_2015-2100.nc,esa,seals7,seals/default_inputs/esa_seals7_correspondence.csv,luh2-14,seals7,seals/default_inputs/luh2-14_seals7_correspondence.csv,all_variables,time,seals/default_inputs/default_global_coefficients.csv,lulc\esa\lulc_esa_2017.tif,seals/default_inputs/rwa_bdi_regional_changes.csv,cartographic/ee/ee_r264_correspondence.gpkg,ee_r264_label
+
+Scenario A: You want to run a High Emission future.
+
+Create/Paste italy_ssp5_rcp85.csv into the scenarios folder.
+
+Change the top line of Python code: current_csv_name = 'italy_ssp5_rcp85.csv'
+
+Run it.
+
+Result: It creates a new folder projects/italy_ssp5_rcp85_run. Your old ssp2 folder is safe!
+
+
+
+
+
+
+
+
+## 4\. How to Run the Model (Workflow)
+
+We use a **"One Driver, Many Passengers"** workflow. You have one Python script (the driver) that can run many different CSV files (the passengers/scenarios).
+
+### Step 1: Create the Scenario (CSV)
+
+Create a file in `seals_dev/scenarios/` (e.g., `italy_ssp2.csv`).
+
+  * **AOI:** Change `RWA` to your country code (e.g., `ITA`, `VNM`).
+  * **Years:** Set your simulation years (e.g., `2040 2060`).
+  * **Model Label:** Use a unique name like `luh2-message-ita` to force the model to extract fresh data for your country.
+
+### Step 2: Configure the Driver (Python)
+
+Use the robust script below. It dynamically names the output folder based on your CSV name, preventing "Groundhog Day" loops.
+
+**`run_thesis.py`:**
+
+```python
+import os, sys
+import hazelbean as hb
+import pandas as pd
+from seals import seals_initialize_project
+
+if __name__ == '__main__':
+    p = hb.ProjectFlow()
+    
+    # --- USER CONFIGURATION ---
+    current_csv_name = 'italy_ssp2.csv'  # CHANGE THIS FILENAME TO SWITCH SCENARIOS
+    # --------------------------
+
+    # Setup Paths
+    p.user_dir = os.path.expanduser('~')
+    p.extra_dirs = ['Files', 'seals', 'projects']
+    
+    # Auto-name the output folder based on the CSV
+    p.project_name = current_csv_name.replace('.csv', '') + '_run'
+    
+    # Force Python to find the CSV in the 'scenarios' folder
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    p.scenario_definitions_filename = current_csv_name
+    p.scenario_definitions_path = os.path.join(script_dir, 'scenarios', current_csv_name)
+
+    # Safety Check
+    if not os.path.exists(p.scenario_definitions_path):
+        raise FileNotFoundError(f"CRITICAL: Cannot find {p.scenario_definitions_path}")
+
+    # Initialize
+    p.scenarios_df = pd.read_csv(p.scenario_definitions_path)
+    p.project_dir = os.path.join(p.user_dir, *p.extra_dirs, p.project_name)
+    p.set_project_dir(p.project_dir)
+    p.run_in_parallel = 1 
+
+    # Run
+    seals_initialize_project.build_standard_task_tree(p)
+    p.base_data_dir = os.path.join(p.user_dir, 'Files/base_data')
+    seals_initialize_project.set_advanced_options(p)
+    p.execute()
+```
+
+### Step 3: Execute
+
+```bash
+python run_thesis.py
+```
+
+-----
+
+## 5\. Technical Logic: The Task Tree
+
+When the model runs, it executes these phases in order:
+
+### Phase A: Pre-Processing (`fine_processed_inputs`)
+
+  * **Downloads:** Fetches the ESA Land Cover map (300m).
+  * **Convolution:** Applies a Gaussian blur to create "proximity" layers (e.g., "How close is this pixel to a city?").
+
+### Phase B: Coarse Change (`coarse_change`)
+
+  * **Extraction:** It overlays your Country Boundary (AOI) on the Global Climate Model (LUH2).
+  * **Math:** It calculates the exact number of hectares changing.
+  * *Note:* If the model runs instantly (0.001s), it likely skipped this step because it found cached data from a previous run.
+
+### Phase C: Allocation (`allocation_zones`)
+
+  * **Parallelization:** Splits the country into $1^\circ \times 1^\circ$ tiles.
+  * **Scoring:** Every pixel gets a score:
+    $$Score = \beta(Slope) + \beta(Soil) + \beta(Distance) + \beta(Neighborhood)$$
+  * **Conversion:** Pixels with the highest scores convert until the Phase B budget is met.
+
+### Phase D: Stitching (`stitched_lulc...`)
+
+  * Merges the parallel tiles back into a single `.tif` map.
+
+-----
+
+## 6\. Troubleshooting Guide
+
+We encountered several specific errors. Here is how to solve them.
+
+| Error / Symptom | Cause | Solution |
+| :--- | :--- | :--- |
+| **`TIFFReadDirectory: Failed to read`** | Internet cut out during a download, creating a corrupted file. | Go to `~/Files/base_data/`, find the broken `.tif` (e.g., `precip_mm.tif`), and **delete it**. Run the script again to redownload. |
+| **The "Ghost File" (Map is old/wrong)** | You ran the script, but it loaded a default config or an old CSV because paths were wrong. | Use the `run_thesis.py` script above with absolute paths. Ensure your CSV is in `scenarios/`. |
+| **Run finishes instantly (\<1 min)** | The "Lazy Robot" problem. `hazelbean` sees existing files in the output folder and skips work. | **Delete the output folder** `projects/your_run_name` to force a recalculation. |
+| **`AttributeError: NoneType... GetRasterBand`** | The model failed to extract coarse data (Phase B) but tried to process it anyway. | 1. Delete the output folder. <br> 2. In your CSV, rename `model_label` (e.g., to `luh2-message-ita`) to force a fresh extraction. |
+| **Map is blank/wrong country** | The model defaulted to Rwanda (`RWA`) because it couldn't find your CSV. | Ensure your CSV has the correct ISO-3 code (`ITA`, `VNM`) and that your Python script points specifically to it. |
+
+-----
+
+## 7\. Interpreting Results
+
+Go to `~/Files/seals/projects/[your_project_name]/`.
+
+  * **The Final Map:** `intermediate/stitched_lulc_simplified_scenarios/`
+      * Open `.tif` files in QGIS.
+  * **Quick Images:** `intermediate/visualization/lulc_pngs/`
+      * Side-by-side comparison images.
+  * **The Numbers:** `intermediate/coarse_change/`
+      * CSVs showing the raw hectares of change demanded by the climate model.
+
+
+      This is the definitive, master manual for the SEALS model. It consolidates every lesson, technical detail, and workflow strategy we have developed.
+
+Save this file as **`SEALS_The_Complete_Manual.md`** in your repository.
+
+-----
+
+# The SEALS Manual: Spatial Economic Allocation of Landscape Systems
+
+**A Comprehensive Guide to Downscaling Land-Use Change**
+
+-----
+
+## **1. Conceptual Intuition**
+
+### **1.1 The Problem: The "Resolution Gap"**
+
+Global Integrated Assessment Models (IAMs) like **LUH2** (Land Use Harmonization) operate at a massive scale (typically \~50km pixels). They provide the "Big Picture" for climate change scenarios (e.g., "Italy needs 500 more hectares of cropland by 2040"), but they cannot tell you *where* that cropland should go. They lack local context.
+
+### **1.2 The Solution: SEALS**
+
+SEALS is a **Downscaling Engine**. It acts as a translator between the coarse global models and the fine-grained physical reality of a specific country.
+
+  * **The Input (The "Budget"):** The Global Model says: *"+500ha Cropland, -200ha Forest in grid cell X."*
+  * **The Process (The "Allocation"):** SEALS looks at the local geography (Slope, Soil Quality, Distance to Roads, Proximity to existing farms) to find the best pixels to satisfy that budget.
+  * **The Output (The "Map"):** A 300m resolution map showing exactly *which* pixels changed.
+
+-----
+
+## **2. Installation & Ecosystem Setup**
+
+SEALS relies on `gdal`, a powerful C++ geospatial library. It is notoriously difficult to install correctly. Follow this exact sequence to avoid "DLL load failed" or "Image not found" errors.
+
+### **2.1 Git Configuration (Triangular Workflow)**
+
+To keep your thesis work private while staying updated with the author's code:
+
+1.  **Clone** the author's repository.
+2.  **Rename** the remote: `git remote rename origin upstream`.
+3.  **Create** a private repo on GitHub.
+4.  **Add** your remote: `git remote add origin <your_private_repo_url>`.
+
+### **2.2 The Environment (`seals_env`)**
+
+You must create a Conda environment to handle the C++ dependencies.
+
+```bash
+# 1. Create the environment (Do this once)
+conda create -n seals_env python=3.11 gdal pandas geopandas
+
+# 2. Activate the environment (Do this EVERY time you work)
+conda activate seals_env
+```
+
+### **2.3 Installing the Libraries**
+
+Install the core engine (`hazelbean`) and the model (`seals`) in "Editable Mode" so changes you make are reflected immediately.
+
+```bash
+# Move to your files folder
+cd ~/Files/hazelbean/hazelbean_dev
+pip install -e .
+
+cd ~/Files/seals/seals_dev
+pip install -e .
+```
+
+-----
+
+## **3. The "Golden" Folder Structure**
+
+To avoid the "Ghost File" errors we encountered, we separate **Code**, **Data**, and **Output**. The model expects the `Files` folder to exist in your User Home.
+
+```text
+/Users/your_name/Files/
+│
+├── base_data/                  <-- RAW INPUTS (Heavy Downloads)
+│   ├── lulc/                   (ESA satellite maps - 300m)
+│   ├── luh2/                   (Global Climate projections - 50km)
+│   └── seals/                  (Regressors: Soil, Slope, Altitude)
+│
+└── seals/
+    ├── seals_dev/              <-- YOUR CODE REPOSITORY
+    │   ├── seals/              (Source code: seals_main.py, seals_utils.py)
+    │   ├── scenarios/          <-- YOUR INPUTS (Edit these CSVs)
+    │   │   ├── italy_ssp2.csv
+    │   │   └── vietnam_ssp5.csv
+    │   └── run_thesis.py       <-- YOUR DRIVER SCRIPT
+    │
+    └── projects/               <-- MODEL OUTPUTS (Do not edit manually)
+        ├── standard_rwanda/    (Default test run)
+        └── italy_ssp2_run/     (Your Thesis results)
+```
+
+-----
+
+## **4. The "Driver" Workflow**
+
+We use a **"One Driver, Many Passengers"** approach. You have one Python script (Driver) that reads different CSV files (Passengers).
+
+### **Step 1: The Scenario Configuration (CSV)**
+
+Create a file in `seals_dev/scenarios/`, e.g., `italy_ssp2.csv`.
+
+**Key Columns to Edit:**
+
+  * **`aoi`:** The ISO-3 Country Code (e.g., `ITA`, `VNM`, `USA`). *Crucial: This tells the model which maps to download.*
+  * **`years`:** Space-separated list (e.g., `2030 2040 2050`).
+  * **`model_label`:** A unique tag (e.g., `luh2-message-ita`). *Tip: Change this name if you want to force the model to re-extract climate data.*
+
+### **Step 2: The Driver Script (Python)**
+
+Save this as `run_thesis.py` in `seals_dev/`. It uses **Absolute Paths** to prevent the model from falling back to the Rwanda default.
+
+```python
+import os, sys
+import hazelbean as hb
+import pandas as pd
+from seals import seals_initialize_project
+
+if __name__ == '__main__':
+    p = hb.ProjectFlow()
+    
+    # --- USER SETTINGS ---
+    current_csv_name = 'italy_ssp2.csv'  # CHANGE THIS to switch scenarios
+    # ---------------------
+
+    # 1. Auto-generate Output Folder Name
+    p.project_name = current_csv_name.replace('.csv', '') + '_run'
+    
+    # 2. Locate the CSV (Robust Pathing)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    p.scenario_definitions_path = os.path.join(script_dir, 'scenarios', current_csv_name)
+
+    # 3. Safety Check (Prevents "Rwanda Fallback")
+    if not os.path.exists(p.scenario_definitions_path):
+        raise FileNotFoundError(f"CRITICAL ERROR: Cannot find {p.scenario_definitions_path}")
+
+    # 4. Initialize
+    p.user_dir = os.path.expanduser('~')
+    p.extra_dirs = ['Files', 'seals', 'projects']
+    p.scenarios_df = pd.read_csv(p.scenario_definitions_path)
+    p.project_dir = os.path.join(p.user_dir, *p.extra_dirs, p.project_name)
+    p.set_project_dir(p.project_dir)
+    
+    # 5. Execute
+    p.run_in_parallel = 1 
+    seals_initialize_project.build_standard_task_tree(p)
+    p.base_data_dir = os.path.join(p.user_dir, 'Files/base_data')
+    seals_initialize_project.set_advanced_options(p)
+    p.execute()
+```
+
+-----
+
+## **5. Technical Logic: The Task Tree**
+
+The `hazelbean` engine builds a **Task Tree** (Directed Acyclic Graph) to manage dependencies.
+
+### **Phase A: Pre-Processing (`fine_processed_inputs`)**
+
+  * **Goal:** Create the "Physical Reality" of the Base Year (2017).
+  * **Action:** Downloads ESA Land Cover (300m). Clips it to the AOI (Italy).
+  * **The Math (Convolution):**
+      * *Script:* `seals_utils.fft_gaussian`
+      * *Concept:* **Agglomeration**. Land use change is contagious.
+      * *Operation:* Applies a Gaussian Blur ($\sigma=1, 5$) to the binary maps. This creates a heat map where pixels near cities get higher values (1.0) and pixels far away get low values (0.0).
+
+### **Phase B: Coarse Change (`coarse_change`)**
+
+  * **Goal:** Calculate the "Land Budget" (Demand).
+  * **Action:** Reads the global NetCDF file (`luh2...nc`).
+  * **Logic:**
+    1.  Extracts the grid cells covering Italy.
+    2.  Interpolates between years (e.g., calculates 2045 from 2040/2050 data).
+    3.  Calculates the **Net Demand**: $$(Future\% - Current\%) \times CellSize = \text{Hectares Needed}$$
+  * *Note:* If this phase runs instantly (0.001s), it means the model found cached data.
+
+### **Phase C: Allocation (`allocation_zones`)**
+
+  * **Goal:** The Auction (Spatial Allocation).
+  * **Architecture:** **Parallel Processing**. The model splits the country into $1^\circ \times 1^\circ$ tiles and processes them on different CPU cores.
+  * **The Equation:** Every pixel gets a suitability score ($S$):
+    $$S = \beta_0 + \beta_1(\text{Slope}) + \beta_2(\text{Soil}) + \beta_3(\text{Distance}) + \beta_4(\text{Convolution})$$
+  * **The Decision:**
+    1.  Rank all pixels in the grid cell by Score ($S$).
+    2.  Convert the top-ranking pixels until the "Land Budget" (from Phase B) is spent.
+
+### **Phase D: Stitching (`stitched_lulc...`)**
+
+  * **Goal:** Final Assembly.
+  * **Action:** Uses `gdal.vrt` (Virtual Raster) to glue the processed tiles back into a single `.tif` map.
+
+-----
+
+## **6. Troubleshooting Guide**
+
+| Symptom | Cause | Solution |
+| :--- | :--- | :--- |
+| **Map is wrong (Rwanda instead of Italy)** | The script couldn't find your CSV and defaulted to the test case. | Use the `run_thesis.py` script with **Absolute Paths** (see Section 4). Check `aoi` in CSV. |
+| **Run finishes instantly (\<1 min)** | The "Lazy Robot" logic. `hazelbean` sees existing folders and skips work. | **Delete the output folder** `projects/your_run_name` to force a re-calculation. |
+| **`TIFFReadDirectory` Error** | Internet connection dropped during a download. File is corrupt. | Go to `~/Files/base_data/`, find the broken `.tif` (e.g., `precip_mm.tif`), and **delete it**. |
+| **`AttributeError: NoneType... GetRasterBand`** | Phase B (Coarse Extraction) failed silently because of cached data. | 1. Delete the output folder.<br>2. In CSV, rename `model_label` (e.g., to `luh2-message-ita`) to force fresh extraction. |
+
+-----
+
+## **7. Interpreting the Results**
+
+Navigate to: `~/Files/seals/projects/[your_project_name]/`
+
+### **The Final Maps**
+
+  * **Path:** `intermediate/stitched_lulc_simplified_scenarios/`
+  * **Format:** `.tif` (GeoTIFF)
+  * **Visualization:** Open in **QGIS**.
+  * **Legend:**
+      * 1: Urban (Red)
+      * 2: Cropland (Orange)
+      * 3: Grassland (Yellow)
+      * 4: Forest (Green)
+
+### **Quick Look Images**
+
+  * **Path:** `intermediate/visualization/lulc_pngs/`
+  * **Format:** `.png`
+  * **Use:** Fast sanity checks to ensure the geometry looks correct.
+
+### **The Statistics**
+
+  * **Path:** `intermediate/coarse_change/`
+  * **Format:** `.csv`
+  * **Use:** Verify the raw hectares of change requested by the climate model.
+
+
+  Demand (How Much): Comes from the NetCDF file (luh2...message...nc).

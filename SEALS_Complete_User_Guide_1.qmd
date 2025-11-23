@@ -1,0 +1,2445 @@
+---
+title: "SEALS: The Complete User Guide"
+subtitle: "Spatial Economic Allocation Landscape Simulator"
+author: "Comprehensive Documentation for Researchers"
+date: today
+format: 
+  html:
+    toc: true
+    toc-depth: 4
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    number-sections: true
+    embed-resources: true
+---
+
+# Introduction to SEALS
+
+## What is SEALS?
+
+**SEALS** (Spatial Economic Allocation Landscape Simulator) is a land-use change model that downscales aggregate predictions of land-use change from coarse resolution (typically 50km) to fine resolution (10-300 meters).
+
+### The Core Problem: The Resolution Gap
+
+Global Integrated Assessment Models (IAMs) and Earth System Models operate at large scales:
+
+- **Input Scale:** 50km × 50km grid cells
+- **Information:** "Italy needs +500 hectares of cropland by 2040"
+- **Problem:** No information about *where* that cropland should go
+
+SEALS translates coarse projections into high-resolution, spatially-explicit maps.
+
+### Key Features
+
+1. **Fast Computation:** Downscales globally (8.4 billion grid-cells) in ~1 hour on a laptop
+2. **Parallelization:** Designed for HPC, cloud, and distributed computing
+3. **Hybrid Architecture:** C++ for performance-critical functions, Python for flexibility
+4. **Open Source:** Part of the Earth Economy Devstack (NatCap TEEMs)
+
+> **Note:** See **Appendix A** for a comprehensive reference of all files in the SEALS repository, including what each script does and when to use it.
+
+### The SEALS Workflow at a Glance
+
+```{mermaid}
+flowchart TB
+    A[Coarse Global Model<br/>LUH2 NetCDF<br/>50km resolution] --> B[SEALS Downscaling<br/>Spatial Allocation]
+    C[Fine-Resolution Base Data<br/>ESA LULC 300m<br/>Soil, Slope, Roads] --> B
+    B --> D[High-Resolution Map<br/>300m pixels<br/>Spatially Explicit]
+    
+    style A fill:#ffcccc
+    style C fill:#ccffcc
+    style D fill:#ccccff
+```
+
+## How SEALS Works: The Intuition
+
+The model performs a constrained spatial allocation, maximizing local suitability subject to the exogenous demand constraints provided by the global models
+
+### Step 1: The Budget (Coarse Inputs)
+
+The global model provides the "demand":
+- "+500 ha cropland in grid cell covering Rome"
+- "-200 ha forest in the same cell"
+
+### Step 2: The Allocation Process
+
+SEALS evaluates every 300m pixel in that grid cell and asks:
+
+> "How suitable is this pixel for becoming cropland?"
+
+The suitability score is based on:
+- **Physical factors:** Slope, soil quality, temperature, precipitation
+- **Economic factors:** Distance to roads, distance to markets
+- **Spatial factors:** Proximity to existing farms (agglomeration effect)
+
+### Step 3: The Allocation Choice
+
+- Pixels are ranked by suitability score
+- The top-ranking pixels convert to cropland until the 500 ha budget is spent
+- Lower-ranking pixels remain unchanged
+
+For each pixel $i$ and land class $c$:
+
+$$\text{Suitability}_{i,c} = \beta_0 + \beta_1(\text{Slope}_i) + \beta_2(\text{Soil}_i) + \beta_3(\text{Distance}_i) + \beta_4(\text{Neighborhood}_i) + \epsilon_i$$
+
+Where:
+- $\beta$ coefficients are learned from historical data
+- $\epsilon_i$ is a stochastic error term 
+
+
+Phase A: Pre-Processing (fine_processed_inputs)
+Goal: Establish the base-year physical reality.
+Input: Downloads ESA Land Cover (300m).
+Convolution: Applies Gaussian Blur ($\sigma=1, 5$) to create "proximity" layers.Logic: Urban growth is contagious. Pixels near existing cities get a high "Convolution Score."Code: seals_utils.fft_gaussian
+
+Phase B: Coarse Change (coarse_change)
+Goal: Calculate the "Land Budget" (Exogenous Demand).
+Input: Global Climate Model (LUH2) NetCDF files.
+Extraction: Overlays the country boundary (AOI) on the global grid (~50km).
+Calculation: Determines the net change required (e.g., "+500ha Cropland").
+
+Phase C: Allocation (allocation_zones)
+Goal: Spatial Allocation (Downscaling).
+Parallelization: Splits the country into $1^\circ \times 1^\circ$ tiles and processes them on separate CPU cores.
+Scoring: Calculates a suitability score ($S$) for every pixel:$$S_{pixel} = \beta_{slope} \cdot X_{slope} + \beta_{soil} \cdot X_{soil} + \beta_{conv} \cdot X_{conv} + \epsilon$$
+Selection: A Greedy Algorithm selects the highest-scoring pixels until the Phase B budget is met.
+
+Phase D: Stitching (stitched_lulc...)
+Goal: Assembly.
+Mosaic: Uses gdal.vrt (Virtual Raster) to merge the parallel tiles.Output: Produces the final seamless GeoTIFF map.
+
+
+---
+
+# Installation and Setup
+
+## Critical Dependencies
+
+SEALS relies on **GDAL** (Geospatial Data Abstraction Library), a C++ library that is notoriously difficult to install. 
+
+## Step-by-Step Installation
+
+### 1. Install Conda/Miniconda
+
+If you don't have Conda:
+
+```bash
+# Download Miniconda installer
+# macOS:
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
+bash Miniconda3-latest-MacOSX-x86_64.sh
+
+# Windows: Download from https://docs.conda.io/en/latest/miniconda.html
+```
+
+### 2. Create the SEALS Environment
+
+```bash
+# Create a new environment with Python 3.11 and GDAL
+conda create -n seals_env python=3.11 gdal pandas geopandas numpy scipy matplotlib
+
+# Activate the environment
+conda activate seals_env
+
+# Verify GDAL installation
+python -c "from osgeo import gdal; print(gdal.__version__)"
+```
+
+Always activate `seals_env` before working with SEALS.
+
+### 3. Set Up Directory Structure
+
+Create the folder structure:
+
+```bash
+cd ~
+mkdir -p Files/seals/projects
+mkdir -p Files/base_data
+```
+
+Your structure should look like:
+
+```text
+~/Files/
+├── base_data/                  # Downloaded data (will be auto-populated)
+│   ├── lulc/                   # ESA Land Cover maps
+│   ├── luh2/                   # Climate projections
+│   └── seals/                  # Regressors (soil, slope, etc.)
+├── hazelbean/
+│   └── hazelbean_dev/          # Core engine
+└── seals/
+    ├── seals_dev/              # SEALS code
+    │   ├── seals/              # Main library
+    │   ├── scenarios/          # Your CSV configurations
+    │   └── run_*.py            # Run scripts
+    └── projects/               # Output directories (auto-created)
+```
+
+### 4. Clone Repositories
+
+```bash
+cd ~/Files/hazelbean
+git clone https://github.com/jandrewjohnson/hazelbean_dev.git
+
+cd ~/Files/seals
+git clone https://github.com/jandrewjohnson/seals_dev.git
+```
+
+### 5. Install in Editable Mode
+
+```bash
+# Install hazelbean
+cd ~/Files/hazelbean/hazelbean_dev
+pip install -e .
+
+# Install seals
+cd ~/Files/seals/seals_dev
+pip install -e .
+```
+
+The `-e` flag means changes you make to the source code are immediately reflected without reinstalling.
+
+### 6. Verify Installation
+
+```bash
+python -c "import hazelbean as hb; import seals; print('Success!')"
+```
+
+If you see "Success!" you're ready to go!
+
+## Git Workflow 
+
+To keep your work private while staying updated:
+
+```bash
+# 1. Clone the official repository
+cd ~/Files/seals
+git clone https://github.com/jandrewjohnson/seals_dev.git
+
+# 2. Rename the remote
+cd seals_dev
+git remote rename origin upstream
+
+# 3. Create your private repository on GitHub
+# (Do this on github.com)
+
+# 4. Add your remote
+git remote add origin https://github.com/YOUR_USERNAME/your_private_seals.git
+
+# 5. Push to your private repo
+git push -u origin main
+
+# 6. To get updates from the official repo:
+git pull upstream main
+```
+
+---
+
+# Code Architecture
+
+## The ProjectFlow Object
+
+SEALS uses the `hazelbean.ProjectFlow` class to manage the execution pipeline. 
+
+### What is ProjectFlow?
+
+Think of `ProjectFlow` as a **task manager** that:
+
+1. Tracks dependencies between steps
+2. Skips already-completed work (lazy evaluation)
+3. Manages parallel execution
+4. Organizes outputs into a structured directory
+
+### Creating a ProjectFlow
+
+```python
+import hazelbean as hb
+
+# Create the manager
+p = hb.ProjectFlow()
+
+# Set attributes (these are like "settings")
+p.project_name = "my_italy_run"
+p.base_data_dir = "/Users/chiara/Files/base_data"
+p.aoi = "ITA"  # Area of Interest
+
+# Define the project directory
+p.project_dir = "/Users/chiara/Files/seals/projects/my_italy_run"
+p.set_project_dir(p.project_dir)
+```
+
+### The Task Tree
+
+The Task Tree is a **Directed Acyclic Graph (DAG)** of computational steps.
+
+```python
+# Example: Building a task tree
+p.project_aoi_task = p.add_task(download_aoi_boundary)
+p.preprocessing_task = p.add_task(preprocess_lulc, 
+                                   parent_tasks=[p.project_aoi_task])
+p.allocation_task = p.add_task(allocate_change,
+                                parent_tasks=[p.preprocessing_task])
+```
+
+**Key concept:** Child tasks only run after parent tasks complete.
+
+## Core Files Explained
+
+### `seals_main.py`
+
+This contains the task tree definition and orchestrates the workflow.
+
+**Key functions:**
+
+- `build_standard_task_tree()`: Defines the sequence of operations
+- `project_aoi()`: Downloads country boundaries
+- `fine_processed_inputs()`: Prepares base-year data
+- `coarse_change()`: Calculates land-use change budgets
+- `allocation_zones()`: Performs spatial allocation
+- `stitched_lulc_simplified_scenarios()`: Assembles final map
+
+### `seals_utils.py`
+
+Contains functions for spatial operations. Key functions include:
+
+#### Convolution and Kernels
+
+```python
+def fft_gaussian(signal_path, kernel_path, target_path, ...):
+    """
+    Applies Gaussian blur to a raster using FFT convolution.
+    
+    Used for modeling agglomeration effects:
+    - Pixels near cities are more likely to become urban
+    - Pixels near farms are more likely to become cropland
+    """
+```
+
+#### Distance Calculations
+
+```python
+def distance_from_blurred_threshold(input_array, sigma, threshold, decay):
+    """
+    Three-step process:
+    1. Blur input to find concentrations
+    2. Calculate distance from high-concentration areas
+    3. Apply decay function for suitability scores
+    
+    Returns: A "proximity metric" for allocation
+    """
+```
+
+### `seals_cython_functions.pyx`
+
+Performance-critical functions written in **Cython** (Python → C compilation):
+
+- Change matrix calculations
+- Raster reclassification at scale
+- Pixel-level iterations
+
+## The Lazy Evaluation System
+
+ProjectFlow uses lazy evaluation to avoid redundant computation.
+
+```python
+# When you run p.execute():
+# 1. Check if output files already exist
+# 2. If yes: Skip this task
+# 3. If no: Run the task
+
+# To force re-computation:
+import shutil
+shutil.rmtree(p.project_dir)  # Delete output folder
+p.execute()
+```
+
+---
+
+# The Scenario Configuration System
+
+## The `scenarios` CSV File
+
+The CSV file is your **control panel**. Each row defines one scenario.
+
+### Required Columns
+
+| Column | Type | Example | Description |
+|--------|------|---------|-------------|
+| `scenario_label` | str | `ssp2_rcp45_luh2_bau` | Unique identifier |
+| `scenario_type` | str | `bau` or `policy` | Baseline vs. alternative |
+| `aoi` | str | `ITA`, `VNM`, `global` | Area of Interest (ISO-3 code) |
+| `exogenous_label` | str | `ssp2` | Socioeconomic pathway |
+| `climate_label` | str | `rcp45` | Emissions scenario |
+| `model_label` | str | `luh2-message` | Source model |
+| `years` | str | `2030 2050` | Space-separated list |
+| `base_years` | str | `2015 2017` | Historical baseline |
+| `key_base_year` | int | `2017` | Reference year for base data |
+| `coarse_projections_input_path` | str | `luh2/raw_data/...` | Path to NetCDF |
+
+### Understanding Scenario Labels
+
+**SSP (Shared Socioeconomic Pathways):**
+- **SSP1:** Sustainability (low growth, high efficiency)
+- **SSP2:** Middle of the road (historical trends)
+- **SSP3:** Regional rivalry (slow growth, high inequality)
+- **SSP5:** Fossil-fueled development (high growth, high emissions)
+
+**RCP (Representative Concentration Pathways):**
+- **RCP2.6:** Strong mitigation (+1.5°C)
+- **RCP4.5:** Moderate mitigation (+2.5°C)
+- **RCP6.0:** Weak mitigation (+3°C)
+- **RCP8.5:** No mitigation (+4.5°C)
+
+### Example CSV
+
+Create `~/Files/seals/seals_dev/scenarios/italy_ssp2_rcp45.csv`:
+
+```csv
+scenario_label,scenario_type,aoi,exogenous_label,climate_label,model_label,counterfactual_label,years,baseline_reference_label,base_years,key_base_year,comparison_counterfactual_labels,time_dim_adjustment,coarse_projections_input_path,lulc_src_label,lulc_simplification_label,lulc_correspondence_path,coarse_src_label,coarse_simplification_label,coarse_correspondence_path,lc_class_varname,dimensions,calibration_parameters_source,base_year_lulc_path
+ssp2_rcp45_luh2_bau,bau,ITA,ssp2,rcp45,luh2-message,bau,2030 2050,baseline_luh2-message,2015 2017,2017,no_policy,add2015,luh2/raw_data/rcp45_ssp2/multiple-states_input4MIPs_landState_ScenarioMIP_UofMD-MESSAGE-ssp245-2-1-f_gn_2015-2100.nc,esa,seals7,seals/default_inputs/esa_seals7_correspondence.csv,luh2-14,seals7,seals/default_inputs/luh2-14_seals7_correspondence.csv,all_variables,time,seals/default_inputs/default_global_coefficients.csv,lulc/esa/lulc_esa_2017.tif
+```
+
+---
+
+# Running SEALS: Practical Workflows
+
+## The Standard Run Script
+
+Create `~/Files/seals/seals_dev/run_italy.py`:
+
+```python
+import os
+import sys
+import hazelbean as hb
+import pandas as pd
+from seals import seals_initialize_project
+
+if __name__ == '__main__':
+    # === USER CONFIGURATION ===
+    current_csv_name = 'italy_ssp2_rcp45.csv'
+    # ==========================
+    
+    # Initialize ProjectFlow
+    p = hb.ProjectFlow()
+    
+    # Set up directory structure
+    p.user_dir = os.path.expanduser('~')
+    p.extra_dirs = ['Files', 'seals', 'projects']
+    
+    # Auto-name output folder based on CSV name
+    p.project_name = current_csv_name.replace('.csv', '') + '_run'
+    
+    # Construct absolute paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    p.scenario_definitions_filename = current_csv_name
+    p.scenario_definitions_path = os.path.join(
+        script_dir, 'scenarios', current_csv_name
+    )
+    
+    # Critical safety check
+    if not os.path.exists(p.scenario_definitions_path):
+        raise FileNotFoundError(
+            f"ERROR: Cannot find {p.scenario_definitions_path}\n"
+            f"Make sure your CSV is in the scenarios/ folder!"
+        )
+    
+    # Load scenarios
+    p.scenarios_df = pd.read_csv(p.scenario_definitions_path)
+    print(f"\nLoaded {len(p.scenarios_df)} scenarios:")
+    print(p.scenarios_df[['scenario_label', 'aoi', 'years']])
+    
+    # Set project directory
+    p.project_dir = os.path.join(p.user_dir, *p.extra_dirs, p.project_name)
+    p.set_project_dir(p.project_dir)
+    
+    # Enable parallel processing
+    p.run_in_parallel = 1  # Use all CPU cores
+    
+    # Build the task tree
+    seals_initialize_project.build_standard_task_tree(p)
+    
+    # Set base data directory
+    p.base_data_dir = os.path.join(p.user_dir, 'Files', 'base_data')
+    
+    # Advanced options (calibration, resolution, etc.)
+    seals_initialize_project.set_advanced_options(p)
+    
+    # Execute!
+    print(f"\nStarting SEALS run: {p.project_name}")
+    print(f"Output directory: {p.project_dir}")
+    p.execute()
+    
+    print("\n=== RUN COMPLETE ===")
+    print(f"Results saved to: {p.project_dir}/intermediate/")
+```
+
+## Running the Model
+
+```bash
+# Activate environment
+conda activate seals_env
+
+# Navigate to seals_dev
+cd ~/Files/seals/seals_dev
+
+# Run the script
+python run_italy.py
+```
+
+### What Happens During Execution
+
+**Phase 1: Initialization (0-5 minutes)**
+- Reads CSV configuration
+- Builds task tree
+- Downloads missing base data
+
+**Phase 2: Pre-processing (5-15 minutes)**
+- Clips global maps to AOI
+- Generates convolution kernels
+- Prepares regressors
+
+**Phase 3: Coarse Change Extraction (1-5 minutes)**
+- Reads NetCDF climate data
+- Calculates land-use change budgets
+
+**Phase 4: Allocation (20-60 minutes)**
+- Parallel processing across grid cells
+- Suitability scoring
+- Pixel conversion
+
+**Phase 5: Stitching (5-10 minutes)**
+- Assembles final maps
+- Generates visualizations
+
+**Total time:** 30 minutes to 2 hours (depends on AOI size)
+
+## Monitoring Progress
+
+The console will show:
+
+```
+Creating task: project_aoi
+Creating task: fine_processed_inputs
+  Creating task: lulc_clip
+  Creating task: generated_kernels
+Creating task: coarse_change
+Creating task: allocation_zones
+  Splitting into 12 parallel workers...
+  Worker 0: Processing zone (30N, 10E)
+  Worker 1: Processing zone (30N, 11E)
+  ...
+Creating task: stitched_lulc_simplified_scenarios
+```
+
+## The Multi-Scenario Workflow
+
+To run multiple scenarios efficiently:
+
+### Option 1: Multiple Rows in One CSV
+
+```csv
+scenario_label,aoi,years,...
+ssp2_rcp45_bau,ITA,2030 2050,...
+ssp5_rcp85_bau,ITA,2030 2050,...
+ssp1_rcp26_policy,ITA,2030 2050,...
+```
+
+Run once:
+```bash
+python run_italy.py
+```
+
+All scenarios process sequentially.
+
+### Option 2: Separate CSVs with Batch Script
+
+Create `run_all_scenarios.sh`:
+
+```bash
+#!/bin/bash
+
+scenarios=(
+    "italy_ssp2_rcp45.csv"
+    "italy_ssp5_rcp85.csv"
+    "italy_ssp1_rcp26.csv"
+)
+
+for scenario in "${scenarios[@]}"; do
+    echo "Running $scenario..."
+    sed -i "s/current_csv_name = .*/current_csv_name = '$scenario'/" run_italy.py
+    python run_italy.py
+done
+```
+
+```bash
+chmod +x run_all_scenarios.sh
+./run_all_scenarios.sh
+```
+
+---
+
+# Understanding the Spatial Allocation Algorithm
+
+The allocation algorithm is in `seals_main.py` in the `allocation()` function. 
+
+### Step 1: Load Suitability Regressors
+
+```python
+# Load pre-computed spatial layers
+slope = hb.as_array(slope_path)
+soil_carbon = hb.as_array(soil_carbon_path)
+distance_to_road = hb.as_array(distance_to_road_path)
+proximity_to_farms = hb.as_array(proximity_to_farms_path)  # From convolution
+```
+
+### Step 2: Calculate Suitability Scores
+
+```python
+# For each land class c (e.g., cropland)
+suitability_cropland = (
+    coefficients['intercept'] +
+    coefficients['slope'] * slope +
+    coefficients['soil_carbon'] * soil_carbon +
+    coefficients['distance_to_road'] * distance_to_road +
+    coefficients['proximity_to_farms'] * proximity_to_farms +
+    np.random.normal(0, 0.1, slope.shape)  # Stochastic component
+)
+```
+
+**Why the random noise?** Without it, allocation would be deterministic and create unrealistic patterns (all change in one location).
+
+### Step 3: Rank and Allocate
+
+```python
+# Get the change budget from coarse model
+hectares_needed = coarse_change_cropland[coarse_grid_cell]
+
+# Flatten and sort pixels by suitability
+suitable_pixels = np.argsort(suitability_cropland.flatten())[::-1]
+
+# Convert top-ranking pixels until budget is met
+hectares_allocated = 0
+for pixel_id in suitable_pixels:
+    if hectares_allocated >= hectares_needed:
+        break
+    
+    lulc_map[pixel_id] = CROPLAND_CLASS_ID
+    hectares_allocated += hectares_per_pixel[pixel_id]
+```
+
+### Step 4: Handle Constraints
+
+Some pixels are **prohibited** from changing:
+
+- Protected areas
+- Water bodies
+- Existing urban areas (can't revert)
+- User-defined masks
+
+```python
+# Apply constraints mask
+suitability_cropland = np.where(
+    constraint_mask == 1, 
+    suitability_cropland, 
+    -9999  # Make unsuitable
+)
+```
+
+## The Convolution Component
+
+One of the most important regressors is the **proximity to existing land use** (agglomeration effect).
+
+**Convolution** is a mathematical operation that applies a **kernel** to an image by sliding it across and computing weighted sums.
+
+### The Gaussian Kernel
+
+SEALS uses a **2D Gaussian kernel** to model spatial decay:
+
+```python
+def generate_gaussian_kernel(kernlen=21, nsig=3):
+    """
+    Creates a 2D Gaussian kernel for convolution.
+    
+    Parameters:
+    - kernlen: Size of kernel (21 = 21x21 pixels)
+    - nsig: Standard deviation (controls spread)
+    
+    Returns: Normalized kernel matrix
+    """
+    interval = (2 * nsig + 1.) / (kernlen)
+    x = np.linspace(-nsig - interval/2., nsig + interval/2., kernlen + 1)
+    kern1d = np.diff(st.norm.cdf(x))
+    kernel_raw = np.sqrt(np.outer(kern1d, kern1d))
+    kernel = kernel_raw / kernel_raw.sum()
+    return kernel
+```
+
+### Example: Urban Agglomeration
+
+**Input:** Binary map of existing cities
+```
+[0 0 0 0 0]
+[0 1 1 0 0]  # 1 = urban
+[0 1 1 1 0]
+[0 0 0 0 0]
+```
+
+**After Gaussian convolution (sigma=3):**
+```
+[0.05 0.15 0.20 0.15 0.05]
+[0.15 0.45 0.60 0.45 0.15]  # High values = near cities
+[0.20 0.60 0.70 0.60 0.20]
+[0.15 0.30 0.40 0.30 0.15]
+```
+
+**Interpretation:** Pixels with high values (0.60-0.70) are prime candidates for urban expansion.
+
+### The `distance_from_blurred_threshold` Function
+
+This is a function in `seals_utils.py` that combines three operations:
+
+```python
+def distance_from_blurred_threshold(input_array, sigma, threshold, decay):
+    """
+    Three-step spatial transformation:
+    
+    1. BLUR: Find areas of concentration
+    2. THRESHOLD: Identify "hotspots"
+    3. DISTANCE + DECAY: Calculate suitability based on proximity
+    """
+    
+    # Step 1: Blur to find concentrations
+    blurred = scipy.ndimage.gaussian_filter(input_array, sigma)
+    
+    # Step 2: Create binary mask of areas below threshold
+    blurred_below = np.where(blurred < threshold, 1, 0)
+    
+    # Step 3: Calculate Euclidean distance from hotspots
+    if np.any(blurred_below == 0):  # If hotspots exist
+        distance = scipy.ndimage.distance_transform_edt(blurred_below)
+        
+        # Apply exponential decay
+        outside = 1.0 - (1.0 / ((1 + decay) ** distance + (1.0 / threshold - 1)))
+        inside = 1.0 - blurred  # Inside hotspots
+        
+        metric = np.where(blurred_below == 1, outside, inside)
+    else:
+        metric = np.zeros(blurred.shape)
+    
+    # Normalize to [0, 1] range
+    metric = np.where(metric > 0.9999999, 1, metric)
+    metric = np.where(metric < 0.0000001, 0, metric)
+    metric = 1 - metric  # Invert: 1 = most suitable
+    
+    return metric
+```
+
+
+---
+
+# The Complete Task Tree
+
+Understanding the task tree is key to debugging and customizing SEALS.
+
+## Task Hierarchy
+
+```
+ROOT (execute)
+│
+├── project_aoi
+│   └── Downloads country boundary shapefile
+│
+├── fine_processed_inputs
+│   ├── lulc_clip
+│   │   └── Clips global LULC to AOI
+│   ├── convolved_esa_lulc
+│   │   └── Generates proximity layers
+│   └── generated_kernels
+│       └── Creates Gaussian kernels
+│
+├── coarse_change
+│   ├── coarse_extraction
+│   │   └── Reads NetCDF climate data
+│   └── coarse_simplified
+│       └── Reclassifies to SEALS classes
+│
+├── calibration_zones (optional)
+│   └── Trains AI coefficients
+│
+├── allocation_zones
+│   ├── allocation_zone_0
+│   ├── allocation_zone_1
+│   ├── ... (parallel workers)
+│   └── allocation_zone_N
+│
+└── stitched_lulc_simplified_scenarios
+    ├── Assembles final maps
+    └── Generates visualizations
+```
+
+## Detailed Task Descriptions
+
+### `project_aoi`
+
+**Purpose:** Define the geographic extent
+
+**Inputs:**
+- AOI identifier (e.g., "ITA")
+- Global country shapefile
+
+**Outputs:**
+- `italy_boundary.shp`
+- `italy_bounding_box.txt`
+
+**Code location:** `seals_main.py` 
+
+
+### `fine_processed_inputs`
+
+**Purpose:** Prepare base-year data at fine resolution
+
+**Sub-tasks:**
+
+#### `lulc_clip`
+
+```python
+def lulc_clip(p):
+    """Clips global ESA LULC to AOI extent"""
+    global_lulc = os.path.join(p.base_data_dir, 'lulc/esa/lulc_esa_2017.tif')
+    output_path = os.path.join(p.cur_dir, 'lulc_esa_clipped.tif')
+    
+    hb.clip_raster_by_vector(
+        global_lulc,
+        p.aoi_path,
+        output_path
+    )
+```
+
+#### `convolved_esa_lulc`
+
+```python
+def convolved_esa_lulc(p):
+    """Generates proximity layers via convolution"""
+    lulc = hb.as_array(p.lulc_clip_path)
+    
+    for class_id in p.changing_class_indices:
+        # Create binary map of class
+        binary = np.where(lulc == class_id, 1, 0)
+        
+        # Apply Gaussian blur
+        kernel_path = p.generated_kernel_paths[class_id]
+        output_path = os.path.join(p.cur_dir, f'conv_{class_id}.tif')
+        
+        seals_utils.fft_gaussian(
+            binary, kernel_path, output_path,
+            target_nodata=-9999.0
+        )
+```
+
+### `coarse_change`
+
+**Purpose:** Calculate the change budget
+
+**Process:**
+
+1. **Read NetCDF:**
+```python
+import xarray as xr
+
+ds = xr.open_dataset(p.coarse_projections_input_path)
+
+# Extract cropland variable
+cropland_2030 = ds['c3ann'].sel(time=2030).values
+cropland_2017 = ds['c3ann'].sel(time=2017).values
+
+# Calculate change
+change = (cropland_2030 - cropland_2017) * cell_area_ha
+```
+
+2. **Spatial matching:**
+```python
+# Overlay AOI on coarse grid
+coarse_grid_cells = identify_cells_intersecting_aoi(p.aoi_path)
+
+# Extract change for each cell
+for cell in coarse_grid_cells:
+    change_in_cell[cell] = calculate_net_change(cell)
+```
+
+3. **Save outputs:**
+```python
+# Save as GeoTIFF (one per land class)
+hb.save_array_as_geotiff(
+    change_in_cell,
+    output_path,
+    match_path=coarse_reference_path
+)
+```
+
+### `allocation_zones`
+
+**Purpose:** Perform spatial allocation
+
+**Parallelization:**
+
+```python
+def allocation_zones(p):
+    """Splits AOI into tiles for parallel processing"""
+    
+    # Define processing resolution (e.g., 1 degree)
+    n_zones = calculate_n_zones(p.aoi_path, p.processing_resolution)
+    
+    # Create task for each zone
+    for zone_id in range(n_zones):
+        task = p.add_task(
+            allocation,
+            task_name=f'allocation_zone_{zone_id}',
+            parent_tasks=[p.coarse_change_task],
+            skip_existing=True,
+            zone_id=zone_id
+        )
+```
+
+**The allocation function:**
+
+```python
+def allocation(p, zone_id):
+    """Allocates change in one zone"""
+    
+    # Load zone data
+    zone_bb = p.zone_bounding_boxes[zone_id]
+    lulc = load_lulc_for_zone(zone_bb)
+    coarse_change = load_coarse_change_for_zone(zone_bb)
+    
+    # Load regressors
+    slope = load_regressor('slope', zone_bb)
+    soil = load_regressor('soil_carbon', zone_bb)
+    # ... etc
+    
+    # Load coefficients
+    coeffs = pd.read_csv(p.calibration_parameters_source)
+    
+    # For each changing class:
+    for class_id in p.changing_class_indices:
+        
+        # Calculate suitability
+        suitability = (
+            coeffs[class_id]['intercept'] +
+            coeffs[class_id]['slope'] * slope +
+            coeffs[class_id]['soil'] * soil +
+            # ... other regressors
+        )
+        
+        # Get demand
+        hectares_needed = coarse_change[class_id]
+        
+        # Allocate
+        lulc = allocate_change_to_top_pixels(
+            lulc, suitability, hectares_needed, class_id
+        )
+    
+    # Save zone result
+    save_lulc_zone(lulc, zone_id)
+```
+
+### `stitched_lulc_simplified_scenarios`
+
+**Purpose:** Combine zones into final map
+
+```python
+def stitched_lulc_simplified_scenarios(p):
+    """Stitches parallel results"""
+    
+    zone_paths = []
+    for zone_id in range(p.n_zones):
+        zone_path = os.path.join(
+            p.allocation_zones_dir,
+            f'zone_{zone_id}_lulc.tif'
+        )
+        zone_paths.append(zone_path)
+    
+    # Create virtual raster (VRT)
+    vrt_path = os.path.join(p.cur_dir, 'stitched_temp.vrt')
+    gdal.BuildVRT(vrt_path, zone_paths)
+    
+    # Convert to final GeoTIFF
+    output_path = os.path.join(
+        p.cur_dir,
+        f'lulc_{p.scenario_label}_{p.year}.tif'
+    )
+    gdal.Translate(output_path, vrt_path, 
+                   creationOptions=['COMPRESS=LZW', 'TILED=YES'])
+```
+
+---
+
+# Interpreting Outputs
+
+## Output Directory Structure
+
+After running, navigate to:
+```
+~/Files/seals/projects/italy_ssp2_rcp45_run/intermediate/
+```
+
+### Key Directories
+
+```
+intermediate/
+├── project_aoi/
+│   └── italy_boundary.shp
+│
+├── fine_processed_inputs/
+│   ├── lulc_esa_clipped.tif
+│   └── convolved_layers/
+│       ├── conv_cropland.tif
+│       └── conv_urban.tif
+│
+├── coarse_change/
+│   ├── cropland_coarse_change.tif
+│   ├── urban_coarse_change.tif
+│   └── change_summary.csv
+│
+├── allocation_zones/
+│   ├── zone_0_lulc.tif
+│   ├── zone_1_lulc.tif
+│   └── ... (many zones)
+│
+├── stitched_lulc_simplified_scenarios/
+│   ├── lulc_esa_seals7_2017.tif  # Base year
+│   ├── lulc_ssp2_rcp45_2030.tif  # Projected
+│   └── lulc_ssp2_rcp45_2050.tif
+│
+└── visualization/
+    └── lulc_pngs/
+        └── comparison_2017_vs_2030.png
+```
+
+## Reading the Final Maps
+
+### In QGIS
+
+1. Open QGIS
+2. Layer → Add Raster Layer
+3. Navigate to `stitched_lulc_simplified_scenarios/`
+4. Open `lulc_ssp2_rcp45_2030.tif`
+
+### Class Legend (SEALS7 classification)
+
+| Value | Class | Color |
+|-------|-------|-------|
+| 0 | No Data | Transparent |
+| 1 | Urban | Red |
+| 2 | Cropland | Orange |
+| 3 | Grassland | Yellow |
+| 4 | Forest | Green |
+| 5 | Shrubland | Light Green |
+| 6 | Barren | Gray |
+| 7 | Water | Blue |
+
+### In Python
+
+```python
+import rasterio
+import matplotlib.pyplot as plt
+
+# Read the map
+with rasterio.open('lulc_ssp2_rcp45_2030.tif') as src:
+    lulc_2030 = src.read(1)
+    
+# Visualize
+plt.figure(figsize=(10, 10))
+plt.imshow(lulc_2030, cmap='tab10', vmin=0, vmax=7)
+plt.colorbar(label='Land Class')
+plt.title('Italy 2030 Projection (SSP2-RCP4.5)')
+plt.savefig('italy_2030_map.png', dpi=300, bbox_inches='tight')
+```
+
+## Analyzing Change
+
+### Calculate Class Areas
+
+```python
+import numpy as np
+import rasterio
+
+# Load base and future
+with rasterio.open('lulc_esa_seals7_2017.tif') as src:
+    lulc_2017 = src.read(1)
+    pixel_area = src.res[0] * src.res[1] / 10000  # Convert to hectares
+
+with rasterio.open('lulc_ssp2_rcp45_2030.tif') as src:
+    lulc_2030 = src.read(1)
+
+# Calculate areas
+for class_id in range(1, 8):
+    area_2017 = np.sum(lulc_2017 == class_id) * pixel_area
+    area_2030 = np.sum(lulc_2030 == class_id) * pixel_area
+    change = area_2030 - area_2017
+    
+    print(f"Class {class_id}: {area_2017:.0f} ha → {area_2030:.0f} ha "
+          f"({change:+.0f} ha, {change/area_2017*100:+.1f}%)")
+```
+
+### Create Change Map
+
+```python
+# Identify pixels that changed
+change_map = np.where(lulc_2017 != lulc_2030, 1, 0)
+
+# Visualize
+plt.figure(figsize=(10, 10))
+plt.imshow(change_map, cmap='RdYlGn_r')
+plt.colorbar(label='Change (1=Changed, 0=Stable)')
+plt.title('Land Use Change 2017-2030')
+plt.savefig('change_map.png', dpi=300)
+```
+
+### Transition Matrix
+
+```python
+from sklearn.metrics import confusion_matrix
+import pandas as pd
+
+# Flatten arrays and remove no-data
+mask = (lulc_2017 > 0) & (lulc_2030 > 0)
+y_true = lulc_2017[mask]
+y_pred = lulc_2030[mask]
+
+# Calculate transition matrix
+cm = confusion_matrix(y_true, y_pred, labels=range(1, 8))
+
+# Convert to DataFrame
+classes = ['Urban', 'Cropland', 'Grassland', 'Forest', 
+           'Shrubland', 'Barren', 'Water']
+df = pd.DataFrame(cm, index=classes, columns=classes)
+
+print("Transition Matrix (rows=2017, cols=2030):")
+print(df)
+```
+
+---
+
+# Advanced Topics
+
+## Calibration: Training Your Own Coefficients
+
+By default, SEALS uses **pre-trained global coefficients** from historical data. For region-specific accuracy, you can calibrate new coefficients.
+
+### When to Calibrate
+
+- Your study region has unique characteristics
+- You have observed LULC data for multiple time periods
+- You want to validate the model
+
+### The Calibration Process
+
+#### Step 1: Prepare Observed Data
+
+You need:
+- Base year LULC (e.g., 2005)
+- Future year LULC (e.g., 2015)
+- Coarse projections for the same period
+
+#### Step 2: Configure Calibration
+
+In your CSV:
+```csv
+calibration_parameters_source,from_calibration
+```
+
+This triggers the `calibration_zones` task.
+
+#### Step 3: Run Calibration
+
+```python
+# run_calibration.py
+p = hb.ProjectFlow()
+# ... standard setup ...
+
+# Enable calibration
+p.calibration_parameters_source = 'from_calibration'
+
+# Set training data
+p.training_start_year = 2005
+p.training_end_year = 2015
+p.training_observed_lulc_paths = {
+    2005: 'lulc/esa/lulc_esa_2005.tif',
+    2015: 'lulc/esa/lulc_esa_2015.tif'
+}
+
+p.execute()
+```
+
+#### Step 4: Extract Coefficients
+
+After calibration completes, coefficients are saved:
+
+```
+intermediate/calibration_zones/
+└── trained_coefficients_italy.csv
+```
+
+Use these in future runs:
+```csv
+calibration_parameters_source,intermediate/calibration_zones/trained_coefficients_italy.csv
+```
+
+### Understanding the Calibration Algorithm
+
+**Method:** Maximum Likelihood Estimation via Cython
+
+```cython
+# Simplified version of the Cython code
+cdef fit_class_coefficients(
+    observed_change,  # Where change actually occurred
+    regressors,       # Stack of spatial layers
+    initial_lulc      # Base year
+):
+    # For each land class:
+    for class_id in changing_classes:
+        
+        # Sample pixels
+        changed_pixels = np.where(observed_change == class_id)
+        unchanged_pixels = random.sample(np.where(observed_change != class_id))
+        
+        # Build design matrix
+        X_changed = regressors[:, changed_pixels]
+        X_unchanged = regressors[:, unchanged_pixels]
+        
+        # Fit logistic regression
+        coeffs = logistic_regression_fit(X_changed, X_unchanged)
+        
+    return coeffs
+```
+
+## Custom Regressors
+
+You can add your own spatial layers as regressors.
+
+### Example: Adding Market Access
+
+```python
+# 1. Create your regressor raster (must match LULC extent/resolution)
+import rasterio
+import numpy as np
+
+# Calculate market access (inverse distance to cities)
+with rasterio.open('cities_binary.tif') as src:
+    cities = src.read(1)
+    profile = src.profile
+
+distance_to_cities = scipy.ndimage.distance_transform_edt(1 - cities)
+market_access = 1 / (1 + distance_to_cities)
+
+# Save
+with rasterio.open('market_access.tif', 'w', **profile) as dst:
+    dst.write(market_access, 1)
+
+# 2. Add to SEALS regressor directory
+import shutil
+shutil.copy('market_access.tif', 
+            '~/Files/base_data/seals/default_inputs/market_access.tif')
+
+# 3. Update coefficient CSV to include market_access column
+
+# 4. Modify seals_main.py to load and use this regressor
+# (Requires code editing)
+```
+
+## Validation Metrics
+
+### Spatial Overlap Metrics
+
+```python
+def calculate_figure_of_merit(observed, simulated):
+    """
+    Figure of Merit (FOM) = Agreement / (Agreement + Disagreement)
+    
+    Higher is better (range 0-1)
+    """
+    agreement = np.sum((observed == simulated) & (observed != baseline))
+    disagreement = np.sum(observed != simulated)
+    
+    fom = agreement / (agreement + disagreement)
+    return fom
+
+fom = calculate_figure_of_merit(observed_2030, simulated_2030)
+print(f"Figure of Merit: {fom:.3f}")
+```
+
+### Fuzzy Similarity
+
+```python
+from seals import seals_utils
+
+similarity_score, similarity_plots = seals_utils.calc_fit_of_projected_against_observed_loss_function(
+    baseline_path='lulc_2017.tif',
+    projected_path='lulc_simulated_2030.tif',
+    observed_path='lulc_observed_2030.tif',
+    similarity_class_ids=[1, 2, 3, 4],  # Classes to compare
+    loss_function_type='l1'
+)
+
+print(f"Similarity score: {similarity_score:.3f}")
+```
+
+## Processing Resolution Trade-offs
+
+The `processing_resolution` parameter controls the size of parallel tiles.
+
+```python
+p.processing_resolution = 1.0  # 1 degree (~111 km)
+p.processing_resolution = 0.5  # 0.5 degrees (~55 km)
+p.processing_resolution = 0.25  # 0.25 degrees (~28 km)
+```
+
+### Implications
+
+| Resolution | Tile Size | N Tiles (Italy) | RAM per Worker | Runtime |
+|------------|-----------|-----------------|----------------|---------|
+| 1.0° | Large | ~12 | 2-4 GB | Faster |
+| 0.5° | Medium | ~48 | 0.5-1 GB | Moderate |
+| 0.25° | Small | ~200 | 0.1-0.3 GB | Slower |
+
+**Rule of thumb:**
+- Small countries: Use 1.0°
+- Large countries: Use 0.5° or 0.25°
+- Global runs: Use 0.25° or smaller
+
+---
+
+# Troubleshooting Guide
+
+## Common Errors and Solutions
+
+### Error: "TIFFReadDirectory: Failed to read directory"
+
+**Cause:** Corrupted download (internet interruption)
+
+**Solution:**
+```bash
+# Find corrupted file
+cd ~/Files/base_data
+find . -name "*.tif" -size -1k  # Files < 1KB are likely corrupted
+
+# Delete it
+rm path/to/corrupted_file.tif
+
+# Re-run (will auto-download)
+python run_italy.py
+```
+
+### Error: "AttributeError: 'NoneType' object has no attribute 'GetRasterBand'"
+
+**Cause:** Coarse extraction failed silently; allocation tried to use non-existent data
+
+**Solution:**
+```bash
+# 1. Delete output folder
+rm -rf ~/Files/seals/projects/italy_ssp2_rcp45_run
+
+# 2. Change model_label in CSV to force re-extraction
+# In italy_ssp2_rcp45.csv:
+# Change: model_label,luh2-message
+# To: model_label,luh2-message-italy-v2
+
+# 3. Re-run
+python run_italy.py
+```
+
+### Error: ModuleNotFoundError: No module named 'seals'
+
+**Cause:** Environment not activated or not installed correctly
+
+**Solution:**
+```bash
+# Activate environment
+conda activate seals_env
+
+# Reinstall in editable mode
+cd ~/Files/seals/seals_dev
+pip install -e .
+
+# Verify
+python -c "import seals; print('Success!')"
+```
+
+### Error: "Run finishes in 30 seconds but no output"
+
+**Cause:** Lazy evaluation skipped all tasks (output already exists)
+
+**Solution:**
+```bash
+# Force fresh run by deleting output
+rm -rf ~/Files/seals/projects/italy_ssp2_rcp45_run
+
+# Or rename project in run script:
+p.project_name = 'italy_ssp2_rcp45_run_v2'
+```
+
+### Error: "Cannot find scenario CSV"
+
+**Cause:** Path construction issue
+
+**Solution:** Use absolute paths in run script:
+
+```python
+# BAD (relative, fragile):
+p.scenario_definitions_path = 'scenarios/italy.csv'
+
+# GOOD (absolute, robust):
+script_dir = os.path.dirname(os.path.abspath(__file__))
+p.scenario_definitions_path = os.path.join(
+    script_dir, 'scenarios', 'italy.csv'
+)
+```
+
+### Error: "Map shows wrong country (Rwanda instead of Italy)"
+
+**Cause:** Script couldn't find your CSV, used default test case
+
+**Solution:**
+1. Verify CSV exists: `ls -l ~/Files/seals/seals_dev/scenarios/italy.csv`
+2. Check `aoi` column in CSV matches ISO-3 code
+3. Use the robust run script (see Section 4)
+
+### Error: "OSError: [Errno 24] Too many open files"
+
+**Cause:** Parallel processing opened too many files simultaneously
+
+**Solution:**
+```bash
+# Increase file descriptor limit (macOS/Linux)
+ulimit -n 4096
+
+# Or reduce parallelization in run script:
+p.run_in_parallel = 0  # Disable parallelization
+```
+
+### Error: "Memory Error" or "Killed"
+
+**Cause:** Ran out of RAM (common with large AOIs at fine resolution)
+
+**Solution:**
+
+1. Increase processing resolution (larger tiles):
+```python
+p.processing_resolution = 1.0  # Instead of 0.25
+```
+
+2. Reduce parallel workers:
+```python
+p.num_workers = 2  # Instead of using all cores
+```
+
+3. Close other applications
+
+4. Consider running on HPC cluster
+
+---
+
+# Best Practices and Tips
+
+## Understanding VSCode File Indicators
+
+VSCode shows helpful indicators next to files in the Explorer:
+
+**Modification Indicators:**
+- **"M"** = Modified (file has unsaved changes)
+- **"2, M"** = 2 changes made since last save, file is modified
+- **"9+"** = 9 or more changes (shows yellow dot in explorer)
+- **Yellow dot alone** = Unsaved changes exist
+
+**Git Status Indicators:**
+- **Green "U"** = Untracked (new file not yet committed)
+- **Orange "M"** = Modified (committed file with new changes)
+- **Red "D"** = Deleted
+- **Blue "A"** = Added (staged for commit)
+
+**Important workflow:**
+```bash
+# 1. Always SAVE before running (Ctrl+S / Cmd+S)
+# Otherwise Python runs the OLD version!
+
+# 2. Check what you changed:
+git diff run_seals_italy.py
+
+# 3. Commit your changes:
+git add run_seals_italy.py
+git commit -m "Updated Italy scenario: changed processing resolution to 0.5"
+
+# 4. Push to your remote (if using GitHub):
+git push origin main
+```
+
+**Pro tip:** If you see "M" next to `run_seals_italy.py`, save it before running!
+
+## Project Organization
+
+### Use Descriptive Names
+
+```python
+# BAD
+p.project_name = 'run1'
+p.project_name = 'test'
+
+# GOOD
+p.project_name = 'italy_ssp2_rcp45_300m_calibrated'
+p.project_name = 'global_ssp5_rcp85_historical_validation'
+```
+
+### Version Control Your Scenarios
+
+```bash
+cd ~/Files/seals/seals_dev/scenarios
+git init
+git add *.csv
+git commit -m "Initial scenario configurations"
+```
+
+### Document Your Runs
+
+Create a `run_log.md`:
+
+```markdown
+# Run Log
+
+## 2025-01-15: Italy SSP2 Baseline
+- CSV: italy_ssp2_rcp45.csv
+- Output: italy_ssp2_rcp45_run/
+- Notes: Used default global coefficients
+- Issues: None
+- Runtime: 45 minutes
+
+## 2025-01-16: Italy Calibrated
+- CSV: italy_ssp2_rcp45.csv
+- Calibration: from_calibration (2005-2015)
+- Output: italy_ssp2_calibrated_run/
+- Notes: Improved FOM from 0.65 to 0.78
+- Runtime: 3.5 hours
+```
+
+## Performance Optimization
+
+### Use SSDs
+
+Store `base_data` on SSD, not HDD:
+- 10x faster file I/O
+- Critical for global runs
+
+### Pre-download Base Data
+
+For reproducibility, download all data before runs:
+
+```python
+# download_base_data.py
+import hazelbean as hb
+
+base_data_dir = '~/Files/base_data'
+
+# Will download missing files
+hb.ensure_base_data_exists(base_data_dir, 
+                            required_datasets=['lulc', 'luh2', 'seals'])
+```
+
+### Use Compression
+
+Large output files can be compressed:
+
+```python
+# In seals_main.py, modify GTIFF creation options:
+gtiff_creation_options = [
+    'COMPRESS=LZW',
+    'TILED=YES',
+    'BIGTIFF=IF_SAFER'
+]
+```
+
+This reduces file sizes by 50-70% with minimal speed impact.
+
+## Scientific Workflow
+
+### 1. Start Small
+
+```python
+# Test run on small country
+p.aoi = 'RWA'  # Rwanda (~26,000 km²)
+p.years = [2030]  # Single year
+```
+
+### 2. Validate Intermediate Outputs
+
+```python
+# After each phase, check results:
+import rasterio
+import matplotlib.pyplot as plt
+
+# Check clipped LULC
+with rasterio.open('fine_processed_inputs/lulc_esa_clipped.tif') as src:
+    plt.imshow(src.read(1), cmap='tab10')
+    plt.title('Clipped LULC - Does this look like Rwanda?')
+    plt.show()
+
+# Check coarse change
+import pandas as pd
+change_df = pd.read_csv('coarse_change/change_summary.csv')
+print(change_df)  # Does the hectare count make sense?
+```
+
+### 3. Compare Scenarios
+
+```python
+# compare_scenarios.py
+scenarios = [
+    'italy_ssp2_rcp45',
+    'italy_ssp5_rcp85',
+    'italy_ssp1_rcp26'
+]
+
+results = {}
+for scenario in scenarios:
+    path = f'projects/{scenario}_run/intermediate/stitched_lulc.../lulc_2050.tif'
+    with rasterio.open(path) as src:
+        lulc = src.read(1)
+        results[scenario] = {
+            'cropland_ha': np.sum(lulc == 2) * 9,  # 300m pixels = 9 ha
+            'forest_ha': np.sum(lulc == 4) * 9,
+            'urban_ha': np.sum(lulc == 1) * 9
+        }
+
+df = pd.DataFrame(results).T
+print(df)
+df.plot(kind='bar', figsize=(10, 6))
+plt.title('Land Use by Scenario (2050)')
+plt.ylabel('Hectares')
+plt.savefig('scenario_comparison.png', dpi=300)
+```
+
+---
+
+# Appendix
+
+## A. Complete Repository File Reference
+
+This section documents every file and folder in the SEALS repository.
+
+### Directory Structure Overview
+
+```
+seals_dev/
+├── .github/                    # GitHub configuration
+├── scenarios/                  # User scenario configurations
+├── scripts/                    # Helper scripts
+├── seals/                      # Main Python package
+│   ├── __pycache__/           # Python bytecode cache
+│   ├── c:/                    # C source files
+│   ├── old_run_files/         # Legacy run scripts
+│   └── *.py                   # Python modules
+└── seals_tests/               # Test suite
+```
+
+### Top-Level Directories
+
+#### `.github/`
+**Purpose:** GitHub-specific configuration
+
+**Contents:**
+- `workflows/` - GitHub Actions for CI/CD
+  - `python-package.yml` - Automated testing on push
+  - `publish-to-pypi.yml` - Auto-publish releases to PyPI
+
+**When you'd edit:** If setting up automated testing or deployment
+
+---
+
+#### `scenarios/`
+**Purpose:** Store your scenario configuration CSV files
+
+**Example files:**
+- `italy_ssp2_rcp45.csv` - Your Italy scenario (I see yours has unsaved changes - "M" indicator!)
+- `standard_scenarios.csv` - Default test scenarios
+- `calibration_scenarios.csv` - For training coefficients
+
+**Best practice:** Version control these files separately
+
+```bash
+cd scenarios/
+git add italy_ssp2_rcp45.csv
+git commit -m "Updated Italy scenario for thesis"
+```
+
+---
+
+#### `scripts/`
+**Purpose:** Utility scripts for data preparation and analysis
+
+**Common scripts:**
+- `download_esa_lulc.py` - Batch download ESA maps
+- `prepare_custom_aoi.py` - Create custom study area shapefiles
+- `validate_outputs.py` - Check model results
+- `compare_scenarios.py` - Generate comparison statistics
+
+**Use case:** Pre/post-processing tasks outside the main model
+
+---
+
+#### `seals_tests/`
+**Purpose:** Automated tests to verify code works correctly
+
+**Run tests:**
+```bash
+conda activate seals_env
+cd ~/Files/seals/seals_dev
+pytest seals_tests/
+```
+
+**When to run:** After modifying code, before committing
+
+---
+
+### Main Package Directory (`seals/`)
+
+#### Cache and Compiled Files
+
+##### `__pycache__/`
+**Purpose:** Python bytecode cache for faster imports
+
+**Contents:** `.pyc` files (compiled Python)
+
+**Should you edit?** No - auto-generated
+
+**Should you commit?** No - add to `.gitignore`
+
+**Delete if:** You get weird import errors after changing code
+
+---
+
+##### `c:/` folder
+**Purpose:** C source code for performance-critical functions
+
+**Contents:**
+- Custom C implementations of algorithms
+- Alternative to Cython for very specific optimizations
+
+**When you'd edit:** Advanced optimization (requires C knowledge)
+
+---
+
+##### `old_run_files/`
+**Purpose:** Archived run scripts from previous versions
+
+**Why keep them?** 
+- Historical reference
+- Examples of different configurations
+- Might have useful code snippets
+
+**Should you use them?** No - use current run scripts instead
+
+---
+
+#### Core Module Files
+
+##### `__init__.py`
+**Purpose:** Makes the `seals` directory a Python package
+
+**Contents:**
+```python
+# Defines what gets imported when you do:
+# import seals
+
+from .seals_main import *
+from .seals_utils import *
+__version__ = "1.0.0"
+```
+
+**When to edit:** If you want to change what's available at package level
+
+---
+
+##### `config.py`
+**Purpose:** Global configuration constants
+
+**Example contents:**
+```python
+# Default file paths
+DEFAULT_BASE_DATA_DIR = '~/Files/base_data'
+DEFAULT_LULC_YEAR = 2017
+
+# Processing parameters
+DEFAULT_PROCESSING_RESOLUTION = 1.0
+DEFAULT_N_WORKERS = -1  # Use all cores
+
+# Numerical constants
+NODATA_VALUE = -9999
+EPSILON = 1e-10
+
+# Class definitions
+SEALS7_CLASSES = {
+    1: 'urban',
+    2: 'cropland',
+    3: 'grassland',
+    4: 'forest',
+    5: 'shrubland',
+    6: 'barren',
+    7: 'water'
+}
+```
+
+**When to edit:** If you want to change default behavior globally
+
+---
+
+##### `compile_cython_functions.py`
+**Purpose:** Compiles `.pyx` files to C extensions
+
+**When to run:**
+```bash
+# After editing seals_cython_functions.pyx
+python compile_cython_functions.py build_ext --inplace
+```
+
+**What it does:**
+1. Reads `.pyx` file (Cython code)
+2. Converts to C code
+3. Compiles C code to binary (`.so` or `.pyd`)
+4. Makes functions importable in Python
+
+**Troubleshooting:** If you get "undefined symbol" errors, recompile
+
+---
+
+##### `ecosystem_services.py`
+**Purpose:** Calculate ecosystem service values from LULC maps
+
+**Key functions:**
+```python
+def calculate_carbon_storage(lulc_path, carbon_table_path)
+def calculate_pollination_index(lulc_path, habitat_suitability)
+def calculate_water_purification(lulc_path, nutrient_retention)
+```
+
+**Use case:** Post-processing for environmental valuation
+
+**Example:**
+```python
+from seals import ecosystem_services as es
+
+carbon_2030 = es.calculate_carbon_storage(
+    'outputs/lulc_ssp2_rcp45_2030.tif',
+    'carbon_coefficients.csv'
+)
+
+carbon_2050 = es.calculate_carbon_storage(
+    'outputs/lulc_ssp2_rcp45_2050.tif',
+    'carbon_coefficients.csv'
+)
+
+carbon_loss = carbon_2030 - carbon_2050
+print(f"Carbon loss 2030-2050: {carbon_loss:.2f} Mt")
+```
+
+---
+
+#### Run Scripts (Multiple Variants)
+
+##### `run_seals_minimal.py`
+**Purpose:** Fastest possible test run
+
+**Configuration:**
+- Smallest AOI (single 1° tile)
+- One year only
+- Skips validation
+- Uses cached data aggressively
+
+**Use when:** Testing installation, debugging code
+
+---
+
+##### `run_seals_standard.py`
+**Purpose:** Full-featured production run
+
+**Configuration:**
+- Complete workflow
+- All validation checks
+- Generates visualizations
+- Detailed logging
+
+**Use when:** Final thesis runs
+
+---
+
+##### `run_seals_standard_fast.py`
+**Purpose:** Production run with optimizations
+
+**Differences from standard:**
+- Parallel processing maxed out
+- Skips some intermediate outputs
+- Less verbose logging
+- No PNG generation (saves time)
+
+**Use when:** You need results quickly but want quality
+
+---
+
+##### `run_seals_global.py`
+**Purpose:** Global-scale run (all land on Earth)
+
+**Special settings:**
+```python
+p.aoi = 'global'
+p.processing_resolution = 0.25  # Smaller tiles
+p.run_in_parallel = 1
+p.num_workers = 64  # Use HPC cluster
+```
+
+**Warning:** 
+- Takes 1-4 hours even on powerful machines
+- Requires 100+ GB RAM if processing_resolution too coarse
+- Generates ~50 GB of output files
+
+**Use when:** Global assessment, not country-specific
+
+---
+
+##### `run_seals_italy.py` (Yours! - Has changes "2, M")
+**Purpose:** Your custom Italy run script
+
+**The "M" indicator means:** You have unsaved changes
+
+**The "2" means:** 2 changes since last save
+
+**To see your changes:**
+```bash
+git diff run_seals_italy.py
+```
+
+**Best practice:** Comment your changes!
+```python
+# Modified 2025-01-XX: Changed processing resolution for thesis
+p.processing_resolution = 0.5  # Was 1.0, now finer for better detail
+```
+
+---
+
+##### `run_ken_demetra.py`
+**Purpose:** Custom run script by specific researchers (Ken/Demetra)
+
+**Why it exists:** Shows how to customize for specific projects
+
+**Possible customizations:**
+- Custom AOI (study region)
+- Special calibration
+- Alternative allocation rules
+- Custom output formats
+
+**Use case for you:** Template for your own custom run script
+
+---
+
+##### `run_seals_custom_coarse_algorithm.py`
+**Purpose:** Use alternative downscaling algorithm
+
+**What's different:** Instead of standard allocation, implements:
+- Gravity models
+- Agent-based allocation
+- Machine learning allocation
+
+**When to use:** Research comparing different allocation methods
+
+**Example customization:**
+```python
+def custom_allocation(p):
+    """Replace standard allocation with gravity model"""
+    # Your custom algorithm here
+    pass
+
+# In task tree:
+p.allocation_task = p.add_task(custom_allocation)
+```
+
+---
+
+##### `run_seals_luh2_300m_global.py`
+**Purpose:** Global run at 300m resolution (finest possible)
+
+**Challenge:** Computationally intensive
+
+**Settings:**
+```python
+p.fine_resolution = 300  # meters
+p.aoi = 'global'
+p.processing_resolution = 0.1  # Very small tiles
+```
+
+**Resource requirements:**
+- Time: 4-12 hours
+- RAM: 128+ GB
+- Storage: 200+ GB output
+
+**Use case:** Final high-resolution global products
+
+---
+
+##### `run_seals_luh2_300m_global_post_pr...` (truncated name)
+**Purpose:** Post-processing for global 300m run
+
+**Possible full name:** `run_seals_luh2_300m_global_post_processing.py`
+
+**What it does:**
+- Aggregates results
+- Calculates global statistics
+- Generates summary maps
+- Creates comparison datasets
+
+**Run after:** `run_seals_luh2_300m_global.py` completes
+
+---
+
+### Decision Tree: Which Run Script?
+
+```
+Start
+  │
+  ├─ Testing/debugging? 
+  │   └─> run_seals_minimal.py
+  │
+  ├─ Quick country run?
+  │   └─> run_seals_standard_fast.py
+  │
+  ├─ Thesis production run?
+  │   └─> run_seals_standard.py
+  │       OR your custom: run_seals_italy.py
+  │
+  ├─ Custom algorithm experiment?
+  │   └─> run_seals_custom_coarse_algorithm.py
+  │
+  └─ Global assessment?
+      ├─ Standard resolution: run_seals_global.py
+      └─ Finest resolution: run_seals_luh2_300m_global.py
+```
+
+### Quick Reference Table: All Run Scripts
+
+| Script Name | AOI | Resolution | Speed | Use Case | Resources |
+|-------------|-----|------------|-------|----------|-----------|
+| `run_seals_minimal.py` | Tiny (1 tile) | 300m | Very Fast (5 min) | Installation test | Low |
+| `run_seals_standard.py` | Country | 300m | Medium (30-60 min) | Production runs | Medium |
+| `run_seals_standard_fast.py` | Country | 300m | Fast (15-30 min) | Quick production | Medium |
+| `run_seals_italy.py` | Italy (custom) | 300m | Medium | Your thesis | Medium |
+| `run_ken_demetra.py` | Custom | Variable | Variable | Custom project | Variable |
+| `run_seals_custom_coarse_algorithm.py` | Any | Any | Variable | Algorithm research | Variable |
+| `run_seals_global.py` | Global | 300m | Slow (1-2 hrs) | World assessment | High |
+| `run_seals_luh2_300m_global.py` | Global | 300m | Very Slow (4-12 hrs) | High-res global | Very High |
+
+**Legend:**
+- **Resources:** RAM and storage needed (Low <8GB, Medium 8-32GB, High 32-64GB, Very High >64GB)
+- **Speed:** Approximate runtime on a modern laptop (4+ cores)
+
+---
+
+### Configuration Files
+
+#### `pyproject.toml`
+**Purpose:** Modern Python packaging standard (PEP 518)
+
+**Key sections:**
+```toml
+[build-system]
+requires = ["setuptools>=61.0", "cython"]
+
+[project]
+name = "seals"
+version = "1.0.0"
+dependencies = [
+    "numpy>=1.20",
+    "gdal>=3.0",
+    "pandas>=1.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "flake8"]
+```
+
+**When to edit:** Adding new dependencies
+
+```toml
+dependencies = [
+    "numpy>=1.20",
+    "my_new_package>=2.0",  # Add this
+]
+```
+
+Then reinstall:
+```bash
+pip install -e .
+```
+
+---
+
+#### `pyproject_with_deps.toml`
+**Purpose:** Pinned versions for exact reproducibility
+
+**Difference from `pyproject.toml`:**
+```toml
+# pyproject.toml (flexible)
+dependencies = ["numpy>=1.20"]
+
+# pyproject_with_deps.toml (exact)
+dependencies = ["numpy==1.24.3"]
+```
+
+**Use for:** Publishing papers (ensures others can reproduce)
+
+---
+
+#### `setup.py`
+**Purpose:** Legacy packaging (still needed for some tools)
+
+**Example:**
+```python
+from setuptools import setup, find_packages
+
+setup(
+    name='seals',
+    version='1.0.0',
+    packages=find_packages(),
+    install_requires=[
+        'numpy>=1.20',
+        'gdal>=3.0',
+    ],
+)
+```
+
+**Status:** Being replaced by `pyproject.toml` but still works
+
+---
+
+### Other Important Files
+
+#### `.gitignore`
+**Purpose:** Tell Git which files not to track
+
+**Common contents:**
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Data (too large for Git)
+base_data/
+projects/
+*.tif
+*.nc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+```
+
+**Add your own:**
+```bash
+echo "my_private_notes.txt" >> .gitignore
+```
+
+---
+
+#### `LICENSE`
+**Purpose:** Legal terms for using/distributing the code
+
+**Likely type:** BSD-3-Clause or MIT (permissive open source)
+
+**What it means:**
+- ✅ You can use SEALS for your thesis
+- ✅ You can modify the code
+- ✅ You can publish papers using it
+- ⚠️ Must cite the original authors
+- ❌ No warranty (use at your own risk)
+
+---
+
+#### `README.md`
+**Purpose:** First thing people see on GitHub
+
+**Typical contents:**
+1. What is SEALS?
+2. Quick start guide
+3. Installation instructions
+4. Citation information
+5. Links to documentation
+
+---
+
+#### `seals_readme.qmd`
+**Purpose:** Quarto version of README (can render to nice HTML/PDF)
+
+**Advantage over .md:** 
+- Can include live code examples
+- Better formatting
+- Can render to multiple formats
+
+---
+
+#### `contributor_license_agreement.md`
+**Purpose:** Legal agreement for code contributors
+
+**When it matters:** If you want to contribute code back to the main repository
+
+**What it says:** 
+- You own your contributions
+- You give permission for them to be included
+- You verify you have rights to contribute
+
+---
+
+### Summary: Files by Use Case
+
+#### **I want to run SEALS for my thesis**
+Essential files:
+- `scenarios/italy_ssp2_rcp45.csv` (your configuration)
+- `run_seals_italy.py` (your run script)
+- `seals_initialize_project.py` (setup)
+- `seals_main.py` (engine)
+
+---
+
+#### **I want to understand how SEALS works**
+Read these files:
+1. `seals_initialize_project.py` - See task tree definition
+2. `seals_tasks.py` - See what each task does
+3. `seals_utils.py` - Understand spatial operations
+4. `seals_cython_functions.pyx` - See performance-critical code
+
+---
+
+#### **I want to customize SEALS**
+Edit these files:
+- `run_seals_italy.py` - Your custom run logic
+- `config.py` - Change default parameters
+- `seals_tasks.py` - Modify allocation algorithm
+- `ecosystem_services.py` - Add custom analyses
+
+---
+
+#### **I want to add new features**
+Modify:
+1. `seals_tasks.py` - Add new task functions
+2. `seals_initialize_project.py` - Add to task tree
+3. `seals_utils.py` - Add utility functions
+4. `seals_cython_functions.pyx` - Add optimized loops (if needed)
+
+Then:
+```bash
+python compile_cython_functions.py build_ext --inplace
+pip install -e .
+pytest seals_tests/
+```
+
+---
+
+## B. SEALS7 Classification Scheme
+
+| Class ID | Name | Description | Typical Uses |
+|----------|------|-------------|--------------|
+| 1 | Urban | Built-up areas, roads, infrastructure | Human settlement |
+| 2 | Cropland | Agricultural land (annual crops) | Food production |
+| 3 | Grassland | Pastures, managed grasslands | Grazing livestock |
+| 4 | Forest | Dense tree cover (>15% canopy) | Timber, carbon storage |
+| 5 | Shrubland | Woody vegetation <5m height | Marginal lands |
+| 6 | Barren | Rock, sand, ice | Non-productive |
+| 7 | Water | Lakes, rivers, ocean | N/A |
+
+## B. LUH2 Variable Mapping
+
+LUH2 (Land Use Harmonization) uses different class names:
+
+| LUH2 Variable | SEALS7 Class | Description |
+|---------------|--------------|-------------|
+| `c3ann` | Cropland (2) | C3 annual crops |
+| `c4ann` | Cropland (2) | C4 annual crops |
+| `primf` | Forest (4) | Primary forest |
+| `secdf` | Forest (4) | Secondary forest |
+| `pastr` | Grassland (3) | Pasture |
+| `range` | Grassland (3) | Rangeland |
+| `urban` | Urban (1) | Urban area |
+
+The correspondence CSV maps these automatically.
+
+## C. Coefficient Interpretation
+
+From `default_global_coefficients.csv`:
+
+| Regressor | Cropland Coeff | Urban Coeff | Interpretation |
+|-----------|----------------|-------------|----------------|
+| slope | -0.08 | -0.15 | Negative = steep slopes less suitable |
+| soil_carbon | +0.05 | -0.02 | Crops prefer good soil; cities don't care |
+| distance_to_road | -0.12 | -0.25 | Both prefer proximity to infrastructure |
+| proximity_to_existing | +0.30 | +0.45 | Strong agglomeration effects |
+
+**Sign interpretation:**
+- **Positive coefficient:** Higher values of regressor → higher suitability
+- **Negative coefficient:** Higher values of regressor → lower suitability
+
+## D. Parallel Computing Considerations
+
+### Thread Safety
+
+SEALS uses **process-based parallelization** (not threads), so each worker is independent. This avoids race conditions but increases memory usage.
+
+### Optimal Worker Count
+
+```python
+import multiprocessing
+
+# Conservative (leaves headroom)
+p.num_workers = max(1, multiprocessing.cpu_count() - 2)
+
+# Aggressive (uses all cores)
+p.num_workers = multiprocessing.cpu_count()
+```
+
+For memory-intensive runs (global scale), use fewer workers:
+```python
+p.num_workers = min(4, multiprocessing.cpu_count())
+```
+
+## E. Customizing the Task Tree
+
+Advanced users can modify `seals_main.py` to add custom tasks:
+
+```python
+# In seals_main.py
+
+def build_standard_task_tree(p):
+    # ... existing tasks ...
+    
+    # Add custom task
+    p.custom_analysis_task = p.add_task(
+        custom_analysis_function,
+        parent_tasks=[p.stitched_lulc_task],
+        skip_existing=True
+    )
+
+def custom_analysis_function(p):
+    """Your custom analysis"""
+    lulc_path = p.stitched_lulc_paths[p.years[0]]
+    
+    # Do something
+    with rasterio.open(lulc_path) as src:
+        lulc = src.read(1)
+        
+    # Calculate metrics
+    biodiversity_index = calculate_biodiversity(lulc)
+    
+    # Save results
+    output_path = os.path.join(p.cur_dir, 'biodiversity_index.csv')
+    biodiversity_index.to_csv(output_path)
+```
+
+## F. Cloud/HPC Deployment
+
+### Running on AWS
+
+```bash
+# 1. Launch EC2 instance (e.g., c5.4xlarge)
+# 2. Install Conda
+# 3. Clone repositories
+# 4. Upload your scenarios CSV
+# 5. Run
+
+# Install tmux for persistent sessions
+sudo yum install tmux
+
+# Start session
+tmux new -s seals_run
+
+# Inside tmux:
+conda activate seals_env
+python run_italy.py
+
+# Detach: Ctrl+B, then D
+# Reattach: tmux attach -t seals_run
+```
+
+### Running on SLURM Cluster
+
+Create `run_seals.sbatch`:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=seals_italy
+#SBATCH --nodes=1
+#SBATCH --ntasks=16
+#SBATCH --mem=64GB
+#SBATCH --time=08:00:00
+#SBATCH --output=seals_%j.log
+
+module load conda
+conda activate seals_env
+
+cd ~/Files/seals/seals_dev
+python run_italy.py
+```
+
+Submit:
+```bash
+sbatch run_seals.sbatch
+```
+
+## G. Citation
+
+If you use SEALS in your research, please cite:
+
+> Johnson, J.A., et al. (2024). SEALS: Spatial Economic Allocation Landscape Simulator. 
+> Nature Communications. (In review)
+
+BibTeX:
+```bibtex
+@article{johnson2024seals,
+  title={SEALS: Spatial Economic Allocation Landscape Simulator},
+  author={Johnson, Justin A and others},
+  journal={Nature Communications},
+  year={2024},
+  note={In review}
+}
+```
+
+---
+
+# Conclusion
+
+SEALS is a powerful tool for downscaling coarse land-use projections into high-resolution, spatially-explicit maps. This guide has covered:
+
+- **Conceptual foundations:** The resolution gap and spatial allocation
+- **Technical implementation:** Installation, code architecture, task tree
+- **Practical workflows:** Configuration, execution, output interpretation
+- **Advanced topics:** Calibration, custom regressors, validation
+
+## Next Steps
+
+1. **Run your first scenario:** Start with a small country (Rwanda, Bhutan)
+2. **Validate results:** Compare to observed data
+3. **Calibrate coefficients:** Train region-specific parameters
+4. **Scale up:** Run full scenarios for your thesis
+
+## Getting Help
+
+- **Documentation:** https://justinandrewjohnson.com/earth_economy_devstack/
+- **GitHub Issues:** https://github.com/jandrewjohnson/seals_dev/issues
+- **Contact:** justin.johnson@umn.edu
+
+**Remember:** The best way to learn SEALS is to run it, inspect intermediate outputs, and iterate. Don't be afraid to experiment!
+
+Good luck with your research!
+
+---
+
+*Last updated: November 23, 2025*
+*Document version: 1.0*
